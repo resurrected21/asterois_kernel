@@ -18,6 +18,14 @@ name: Build Kernel (Nothing 3a Pro · KSU-Next / SukiSU + SusFS)
 on:
   workflow_dispatch:
     inputs:
+      kernel_repo:
+        description: "Kernel source repo to build"
+        type: string
+        default: "https://github.com/NothingOSS/android_kernel_msm-6.1_nothing_sm7635"
+      kernel_branch:
+        description: "Kernel source branch"
+        type: string
+        default: "sm7635/b/mr_Frogger"
       root_variant:
         description: "Root solution to build"
         type: choice
@@ -96,16 +104,13 @@ jobs:
           pahole --version   # provides BTF generation (CONFIG_DEBUG_INFO_BTF)
 
       # --------------------------------------------------------------------
-      # Checks out THIS repo at the branch/ref the workflow was launched from
-      # (i.e. your fork + your selected branch), into the kernel/ subdir.
-      - name: Checkout kernel source (this repo)
-        uses: actions/checkout@v4
-        with:
-          path: kernel
-          fetch-depth: 1
-
-      - name: Show kernel version
-        run: head -3 kernel/Makefile
+      # Clone the kernel source (defaults to NothingOSS upstream + Frogger branch).
+      - name: Clone kernel source
+        run: |
+          git clone --depth=1 -b "${{ github.event.inputs.kernel_branch }}" \
+            "${{ github.event.inputs.kernel_repo }}" kernel
+          echo "Source: ${{ github.event.inputs.kernel_repo }} @ ${{ github.event.inputs.kernel_branch }}"
+          head -4 kernel/Makefile
 
       # --------------------------------------------------------------------
       # Cache the toolchain so it's downloaded/patched only once (static key =
