@@ -30,7 +30,11 @@ on:
         type: boolean
         default: false
       stock_boot_url:
-        description: "Optional: direct URL to your STOCK boot.img — produces a patched boot.img too"
+        description: "Optional: direct URL to your STOCK boot.img — produces a patched boot.img"
+        type: string
+        default: ""
+      stock_firmware_url:
+        description: "Optional: URL to firmware/OTA zip or payload.bin — boot.img is auto-extracted"
         type: string
         default: ""
       make_release:
@@ -87,7 +91,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             bc bison build-essential ca-certificates ccache cpio curl \
-            dwarves flex git libssl-dev libelf-dev lz4 make openssl \
+            dwarves flex git libssl-dev libelf-dev lz4 make openssl p7zip-full \
             python3 rsync unzip zip zstd libncurses-dev
           pahole --version   # provides BTF generation (CONFIG_DEBUG_INFO_BTF)
 
@@ -309,9 +313,15 @@ jobs:
       # --------------------------------------------------------------------
       # Optional: produce a flashable boot.img by swapping our kernel into the
       # STOCK boot.img (3a Pro is an init_boot device, so boot.img = kernel only;
-      # init_boot/vendor stay stock). Needs a stock_boot_url input.
+      # init_boot/vendor stay stock). This is the RELIABLE install route —
+      # `fastboot flash boot` — and avoids the on-device AnyKernel repack.
+      #
+      # Source the stock boot.img from either:
+      #   stock_boot_url      — a direct boot.img, OR
+      #   stock_firmware_url  — a firmware/OTA zip or payload.bin (auto-extracted).
       - name: Build patched boot.img
-        if: github.event.inputs.stock_boot_url != ''
+        id: bootimg
+        if: github.event.inputs.stock_boot_url != '' || github.event.inputs.stock_firmware_url != ''
         run: |
           if [ "${{ github.event.inputs.root_variant }}" = "SukiSU-Ultra" ]; then RV="SukiSU"; else RV="KSU-Next"; fi
           mkdir -p bootwork && cd bootwork
@@ -324,17 +334,56 @@ jobs:
           unzip -o -q magisk.apk 'lib/x86_64/*' -d magisk
           cp magisk/lib/x86_64/libmagiskboot.so ./magiskboot && chmod +x ./magiskboot
 
-          curl -L -o stock_boot.img "${{ github.event.inputs.stock_boot_url }}"
+          # ---- obtain the stock boot.img (handles .7z / .zip / .gz / .img / payload.bin) ----
+          SRC_URL="${{ github.event.inputs.stock_boot_url }}"
+          [ -z "$SRC_URL" ] && SRC_URL="${{ github.event.inputs.stock_firmware_url }}"
+          echo "Stock source: $SRC_URL"
+          curl -L -o src.dl "$SRC_URL"
+
+          case "$SRC_URL" in
+            *.7z)          7z x -y src.dl >/dev/null ;;
+            *.zip)         unzip -o -q src.dl ;;
+            *.tar.gz|*.tgz) tar xf src.dl ;;
+            *.gz)          gzip -dc src.dl > extracted.img ;;
+            *.img)         cp src.dl stock_boot.img ;;
+            *.bin)         cp src.dl payload.bin ;;
+            *)             cp src.dl unknown.bin ;;
+          esac
+
+          # Locate the boot image from whatever the archive produced.
+          if [ ! -f stock_boot.img ]; then
+            B=$(find . -name 'boot.img' | head -1)
+            if [ -n "$B" ]; then
+              cp "$B" stock_boot.img
+            elif [ -f extracted.img ]; then
+              mv extracted.img stock_boot.img
+            else
+              P=$(find . -name 'payload.bin' | head -1)
+              [ -z "$P" ] && [ -f unknown.bin ] && P=unknown.bin
+              if [ -n "$P" ]; then
+                PD_URL=$(curl -s https://api.github.com/repos/ssut/payload-dumper-go/releases/latest \
+                  | grep -oE 'https://[^"]+_linux_amd64\.tar\.gz' | head -1)
+                curl -L -o pd.tgz "$PD_URL"; tar xf pd.tgz
+                ./payload-dumper-go -p boot -o . "$P"
+                mv boot.img stock_boot.img
+              fi
+            fi
+          fi
+          [ -f stock_boot.img ] || { echo "::error::Could not find a boot.img in the stock source."; exit 1; }
+          head -c8 stock_boot.img | grep -q ANDROID \
+            || echo "::warning::stock_boot.img doesn't start with 'ANDROID!' — wrong file?"
+
+          # ---- swap kernel & repack ----
           ./magiskboot unpack stock_boot.img
-          cp ../kernel/out/arch/arm64/boot/Image ./kernel       # swap in our kernel
-          ./magiskboot repack stock_boot.img                    # -> new-boot.img
+          cp ../kernel/out/arch/arm64/boot/Image ./kernel        # swap in our kernel
+          ./magiskboot repack stock_boot.img                     # -> new-boot.img
           mv new-boot.img "../Xeon-NP3aPro-${RV}-SusFS-boot.img"
           cd ..
           echo "BOOT_IMG=Xeon-NP3aPro-${RV}-SusFS-boot.img" >> "$GITHUB_ENV"
           ls -lh "Xeon-NP3aPro-${RV}-SusFS-boot.img"
 
       - name: Upload patched boot.img
-        if: github.event.inputs.stock_boot_url != ''
+        if: steps.bootimg.outcome == 'success'
         uses: actions/upload-artifact@v4
         with:
           name: ${{ env.BOOT_IMG }}
