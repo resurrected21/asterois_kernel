@@ -1,0 +1,362 @@
+name: Build Kernel (Nothing 3a Pro · KSU-Next / SukiSU + SusFS)
+
+# Builds a GKI android14-6.1 kernel for the Nothing Phone (3a) Pro [asteroids / sm7635]
+# with a SELECTABLE root solution (KernelSU-Next OR SukiSU-Ultra) + SusFS,
+# packaged as a flashable AnyKernel3 zip.
+#
+# Strategy: standalone Clang GKI build (NOT the Bazel/kleaf manifest build).
+# The device boots a GKI kernel, so we only rebuild the generic GKI Image and
+# repack it via AnyKernel3 — vendor_boot / vendor_dlkm stay stock.
+#
+# Toolchain: Neutron Clang (self-contained, fetched via antman). The AOSP
+# googlesource subdir-archive endpoint returns HTTP 400, so we don't use it.
+#
+# Versions are PINNED to matched pairings (avoids upstream drift / SusFS mismatch):
+#   KernelSU-Next : SUSFS v1.5.11 (simonpunk)  + KSU-Next a14-6.1-dev (2025-10)
+#   SukiSU-Ultra  : SUSFS latest  (ShirkNeko)  + SukiSU builtin + scope-min hooks
+
+on:
+  workflow_dispatch:
+    inputs:
+      root_variant:
+        description: "Root solution to build"
+        type: choice
+        options:
+          - KernelSU-Next
+          - SukiSU-Ultra
+        default: KernelSU-Next
+      enable_kpm:
+        description: "SukiSU only: enable KPM (Kernel Patch Module) support"
+        type: boolean
+        default: false
+      stock_boot_url:
+        description: "Optional: direct URL to your STOCK boot.img — produces a patched boot.img too"
+        type: string
+        default: ""
+      make_release:
+        description: "Publish outputs as a GitHub Release"
+        type: boolean
+        default: false
+
+# Cancel an in-progress run if a newer one is started for the same ref.
+concurrency:
+  group: build-kernel-${{ github.ref }}-${{ github.event.inputs.root_variant }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write   # needed to create Releases
+
+env:
+  ANYKERNEL_REPO: "https://github.com/osm0sis/AnyKernel3"
+  SUSFS_BRANCH: "gki-android14-6.1"
+
+  # --- KernelSU-Next pairing (simonpunk SUSFS v1.5.11) ---
+  KSUN_SUSFS_REPO: "https://gitlab.com/simonpunk/susfs4ksu.git"
+  KSUN_SUSFS_COMMIT: "95348c38587f8213c86af17f9fcca01cab268d64"   # susfs4ksu v1.5.11
+  KSUN_REF: "next-susfs-a14-6.1-dev"
+  KSUN_COMMIT: "575d27f046f26f1081000e7ddd8b019e1bd39fb1"         # KSU-Next a14-6.1-dev
+
+  # --- SukiSU-Ultra pairing (ShirkNeko SUSFS, current) ---
+  SUKISU_SUSFS_REPO: "https://github.com/ShirkNeko/susfs4ksu.git"
+  SUKISU_SUSFS_COMMIT: "25d87a06c2893c956fb8e5051816e9b381d1e750"  # ShirkNeko susfs (v2.1.0)
+  SUKISU_REF: "builtin"
+  SUKISU_COMMIT: "6c13a0695a1115e1000c998872b66f4ff5b2f11e"        # SukiSU-Ultra builtin
+  SUKISU_PATCH_REPO: "https://github.com/SukiSU-Ultra/SukiSU_patch.git"
+  SUKISU_HOOKS_PATCH: "hooks/scope_min_manual_hooks_v1.6.patch"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      # --------------------------------------------------------------------
+      - name: Free up disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          # Trimmed for speed: android(~9G)+tool-cache(~8G)+dotnet(~2.7G) is
+          # plenty of headroom; large-packages/swap removal are the slow parts.
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: false
+          swap-storage: false
+
+      # --------------------------------------------------------------------
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bc bison build-essential ca-certificates ccache cpio curl \
+            dwarves flex git libssl-dev libelf-dev lz4 make openssl \
+            python3 rsync unzip zip zstd libncurses-dev
+          pahole --version   # provides BTF generation (CONFIG_DEBUG_INFO_BTF)
+
+      # --------------------------------------------------------------------
+      # Checks out THIS repo at the branch/ref the workflow was launched from
+      # (i.e. your fork + your selected branch), into the kernel/ subdir.
+      - name: Checkout kernel source (this repo)
+        uses: actions/checkout@v4
+        with:
+          path: kernel
+          fetch-depth: 1
+
+      - name: Show kernel version
+        run: head -3 kernel/Makefile
+
+      # --------------------------------------------------------------------
+      # Cache the toolchain so it's downloaded/patched only once (static key =
+      # pinned toolchain; bump v1->v2 to force a refresh).
+      - name: Cache Neutron Clang
+        id: cache-clang
+        uses: actions/cache@v4
+        with:
+          path: clang
+          key: neutron-clang-v1
+
+      - name: Set up Neutron Clang toolchain
+        if: steps.cache-clang.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p clang && cd clang
+          curl -LSs -o antman "https://raw.githubusercontent.com/Neutron-Toolchains/antman/main/antman"
+          chmod +x antman
+          ./antman -S                 # sync latest stable Neutron clang
+          ./antman --patch=glibc      # patch for the runner's newer glibc
+
+      - name: Export Clang to PATH
+        run: |
+          echo "$GITHUB_WORKSPACE/clang/bin" >> "$GITHUB_PATH"
+          "$GITHUB_WORKSPACE/clang/bin/clang" --version | head -1
+
+      # ===================== KernelSU-Next path =====================
+      - name: Add KernelSU-Next
+        if: github.event.inputs.root_variant == 'KernelSU-Next'
+        working-directory: kernel
+        run: |
+          # The a14-6.1-dev branch bundles the KSU-side SusFS integration.
+          curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" \
+            | bash -s "$KSUN_REF"
+          # Pin to the matched commit (fails loudly if upstream moved past it).
+          ( cd KernelSU-Next && git fetch --depth 1 origin "$KSUN_COMMIT" \
+              && git checkout -q "$KSUN_COMMIT" )
+          echo "KSU-Next pinned @ $KSUN_COMMIT"
+          # Guard: setup.sh silently falls back to a non-SusFS branch on a bad ref.
+          if ! grep -q "config KSU_SUSFS" KernelSU-Next/kernel/Kconfig; then
+            echo "::error::KernelSU-Next checked out without SusFS support."
+            exit 1
+          fi
+          echo "Verified: KSU_SUSFS present in KernelSU-Next Kconfig."
+
+      - name: Apply SusFS (KernelSU-Next · simonpunk v1.5.11)
+        if: github.event.inputs.root_variant == 'KernelSU-Next'
+        working-directory: kernel
+        run: |
+          mkdir -p ../susfs4ksu && cd ../susfs4ksu
+          git init -q; git remote add origin "$KSUN_SUSFS_REPO"
+          git fetch -q --depth 1 origin "$KSUN_SUSFS_COMMIT"; git checkout -q FETCH_HEAD
+          cd "$GITHUB_WORKSPACE/kernel"
+          cp ../susfs4ksu/kernel_patches/fs/* fs/
+          cp ../susfs4ksu/kernel_patches/include/linux/* include/linux/
+          patch -p1 --fuzz=3 < "../susfs4ksu/kernel_patches/50_add_susfs_in_${SUSFS_BRANCH}.patch"
+
+      # ===================== SukiSU-Ultra path =====================
+      - name: Add SukiSU-Ultra
+        if: github.event.inputs.root_variant == 'SukiSU-Ultra'
+        working-directory: kernel
+        run: |
+          # 'builtin' branch = root compiled into the Image (no LKM needed).
+          curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh" \
+            | bash -s "$SUKISU_REF"
+          ( cd KernelSU && git fetch --depth 1 origin "$SUKISU_COMMIT" \
+              && git checkout -q "$SUKISU_COMMIT" )
+          echo "SukiSU-Ultra pinned @ $SUKISU_COMMIT"
+
+      - name: Apply SusFS + manual hooks (SukiSU-Ultra · ShirkNeko)
+        if: github.event.inputs.root_variant == 'SukiSU-Ultra'
+        working-directory: kernel
+        run: |
+          # SusFS kernel side (ShirkNeko fork, matched to SukiSU)
+          mkdir -p ../susfs4ksu && cd ../susfs4ksu
+          git init -q; git remote add origin "$SUKISU_SUSFS_REPO"
+          git fetch -q --depth 1 origin "$SUKISU_SUSFS_COMMIT"; git checkout -q FETCH_HEAD
+          cd "$GITHUB_WORKSPACE/kernel"
+          cp ../susfs4ksu/kernel_patches/fs/* fs/
+          cp ../susfs4ksu/kernel_patches/include/linux/* include/linux/
+          patch -p1 --fuzz=3 < "../susfs4ksu/kernel_patches/50_add_susfs_in_${SUSFS_BRANCH}.patch"
+
+          # SukiSU uses manual syscall hooks (not kprobes) — apply the hook patch.
+          git clone --depth 1 "$SUKISU_PATCH_REPO" ../SukiSU_patch
+          cp "../SukiSU_patch/$SUKISU_HOOKS_PATCH" ./sukisu_hooks.patch
+          patch -p1 -F 3 < ./sukisu_hooks.patch
+
+      # ===================== Common: inject Kconfig =====================
+      - name: Inject KSU + SusFS Kconfig into gki_defconfig
+        working-directory: kernel
+        run: |
+          DEFCONFIG=arch/arm64/configs/gki_defconfig
+          cat >> "$DEFCONFIG" <<'EOF'
+          # --- build with newer Neutron clang: don't fail on new warnings ---
+          # CONFIG_WERROR is not set
+          # --- KernelSU (KSU-Next & SukiSU both use CONFIG_KSU) ---
+          CONFIG_KSU=y
+          # --- SusFS ---
+          CONFIG_KSU_SUSFS=y
+          CONFIG_KSU_SUSFS_SUS_PATH=y
+          CONFIG_KSU_SUSFS_SUS_MOUNT=y
+          CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT=y
+          CONFIG_KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT=y
+          CONFIG_KSU_SUSFS_SUS_KSTAT=y
+          CONFIG_KSU_SUSFS_SUS_OVERLAYFS=y
+          CONFIG_KSU_SUSFS_TRY_UMOUNT=y
+          CONFIG_KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT=y
+          CONFIG_KSU_SUSFS_SPOOF_UNAME=y
+          CONFIG_KSU_SUSFS_ENABLE_LOG=y
+          CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y
+          CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y
+          CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
+          EOF
+
+          # SukiSU needs manual-hook mode; KPM optional.
+          if [ "${{ github.event.inputs.root_variant }}" = "SukiSU-Ultra" ]; then
+            echo "CONFIG_KSU_MANUAL_HOOK=y" >> "$DEFCONFIG"
+            if [ "${{ github.event.inputs.enable_kpm }}" = "true" ]; then
+              echo "CONFIG_KPM=y" >> "$DEFCONFIG"
+            fi
+          fi
+
+      # --------------------------------------------------------------------
+      # Restores compiled-object cache from the most recent prior run so
+      # unchanged source isn't recompiled (saves ~8-10 min on reruns).
+      - name: Cache ccache
+        uses: actions/cache@v4
+        with:
+          path: .ccache
+          key: ccache-${{ github.ref_name }}-${{ github.sha }}
+          restore-keys: |
+            ccache-${{ github.ref_name }}-
+            ccache-
+
+      - name: Build GKI kernel Image
+        working-directory: kernel
+        run: |
+          export ARCH=arm64
+          export SUBARCH=arm64
+          export KBUILD_BUILD_USER=prabh
+          export KBUILD_BUILD_HOST=xeon
+          export CCACHE_DIR="$GITHUB_WORKSPACE/.ccache"
+          export CCACHE_MAXSIZE=5G
+          export CCACHE_COMPILERCHECK=content
+          ccache -z >/dev/null 2>&1 || true
+          # Neutron is an LLVM-only toolchain; LLVM=1 sets CC/LD/AR/etc.
+          # CC="ccache clang" routes compilation through ccache.
+          make O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 CC="ccache clang" gki_defconfig
+          make O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 CC="ccache clang" -j"$(nproc)" Image
+          echo "--- ccache stats ---"; ccache -s
+          ls -lh out/arch/arm64/boot/Image
+
+      # --------------------------------------------------------------------
+      - name: Package with AnyKernel3
+        run: |
+          # Short tag for the chosen root variant.
+          if [ "${{ github.event.inputs.root_variant }}" = "SukiSU-Ultra" ]; then
+            RV="SukiSU"
+          else
+            RV="KSU-Next"
+          fi
+
+          git clone --depth=1 "$ANYKERNEL_REPO" AnyKernel3
+          rm -rf AnyKernel3/.git AnyKernel3/.github AnyKernel3/README.md
+          cp kernel/out/arch/arm64/boot/Image AnyKernel3/Image
+
+          # Minimal GKI anykernel.sh (boot partition, A/B, no dtb repack)
+          cat > AnyKernel3/anykernel.sh <<'EOF'
+          ### AnyKernel3 — Nothing Phone (3a) Pro [asteroids]
+          properties() { '
+          kernel.string=__KERNEL_STRING__
+          do.devicecheck=0
+          do.modules=0
+          do.systemless=1
+          do.cleanup=1
+          do.cleanuponabort=1
+          device.name1=asteroids
+          device.name2=Pong
+          supported.versions=
+          supported.patchlevels=
+          '; }
+          block=boot;
+          is_slot_device=1;
+          ramdisk_compression=auto;
+          patch_vbmeta_flag=auto;
+          . tools/ak3-core.sh;
+          split_boot;
+          flash_boot;
+          EOF
+          sed -i "s|__KERNEL_STRING__|Xeon · Nothing 3a Pro ${RV}+SusFS by prabh (resurrected21)|" \
+            AnyKernel3/anykernel.sh
+
+          cd AnyKernel3
+          ZIP="../Xeon-NP3aPro-${RV}-SusFS-$(date +%Y%m%d-%H%M).zip"
+          zip -r9 "$ZIP" * -x '*.git*' README.md
+          echo "ZIP_NAME=$(basename "$ZIP")" >> "$GITHUB_ENV"
+
+      # --------------------------------------------------------------------
+      - name: Upload flashable zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ZIP_NAME }}
+          path: "*.zip"
+          if-no-files-found: error
+
+      # --------------------------------------------------------------------
+      # Optional: produce a flashable boot.img by swapping our kernel into the
+      # STOCK boot.img (3a Pro is an init_boot device, so boot.img = kernel only;
+      # init_boot/vendor stay stock). Needs a stock_boot_url input.
+      - name: Build patched boot.img
+        if: github.event.inputs.stock_boot_url != ''
+        run: |
+          if [ "${{ github.event.inputs.root_variant }}" = "SukiSU-Ultra" ]; then RV="SukiSU"; else RV="KSU-Next"; fi
+          mkdir -p bootwork && cd bootwork
+
+          # magiskboot (host x86_64 tool) straight from the official Magisk APK.
+          MAGISK_APK=$(curl -s https://api.github.com/repos/topjohnwu/Magisk/releases/latest \
+            | grep -oE 'https://[^"]+Magisk-v[^"]+\.apk' | head -1)
+          echo "Magisk APK: $MAGISK_APK"
+          curl -L -o magisk.apk "$MAGISK_APK"
+          unzip -o -q magisk.apk 'lib/x86_64/*' -d magisk
+          cp magisk/lib/x86_64/libmagiskboot.so ./magiskboot && chmod +x ./magiskboot
+
+          curl -L -o stock_boot.img "${{ github.event.inputs.stock_boot_url }}"
+          ./magiskboot unpack stock_boot.img
+          cp ../kernel/out/arch/arm64/boot/Image ./kernel       # swap in our kernel
+          ./magiskboot repack stock_boot.img                    # -> new-boot.img
+          mv new-boot.img "../Xeon-NP3aPro-${RV}-SusFS-boot.img"
+          cd ..
+          echo "BOOT_IMG=Xeon-NP3aPro-${RV}-SusFS-boot.img" >> "$GITHUB_ENV"
+          ls -lh "Xeon-NP3aPro-${RV}-SusFS-boot.img"
+
+      - name: Upload patched boot.img
+        if: github.event.inputs.stock_boot_url != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.BOOT_IMG }}
+          path: ${{ env.BOOT_IMG }}
+          if-no-files-found: error
+
+      # --------------------------------------------------------------------
+      - name: Create GitHub Release
+        if: github.event.inputs.make_release == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: kernel-${{ github.run_number }}
+          name: "Nothing 3a Pro · ${{ github.event.inputs.root_variant }} + SusFS (build ${{ github.run_number }})"
+          body: |
+            Automated kernel build for **Nothing Phone (3a) Pro** [asteroids / sm7635].
+
+            - Root: **${{ github.event.inputs.root_variant }}** + SusFS
+            - Base: GKI android14-6.1 (6.1.x)
+            - Flash the **AnyKernel3 zip** in recovery, **or** `fastboot flash boot` the boot.img (if attached).
+
+            ⚠️ Unlocked bootloader required. First KSU flash wipes data (`fastboot -w`). Back up first.
+          files: |
+            *.zip
+            *boot.img
+          fail_on_unmatched_files: false
