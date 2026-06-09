@@ -32,11 +32,16 @@ on:
         options:
           - KernelSU-Next
           - SukiSU-Ultra
+          - ReSukiSU
         default: KernelSU-Next
       enable_kpm:
         description: "SukiSU only: enable KPM (Kernel Patch Module) support"
         type: boolean
         default: false
+      enable_susfs:
+        description: "Include SusFS (untick to build root-only, e.g. to isolate a bootloop)"
+        type: boolean
+        default: true
       stock_boot_url:
         description: "Optional: direct URL to your STOCK boot.img — produces a patched boot.img"
         type: string
@@ -76,6 +81,10 @@ env:
   SUKISU_PATCH_REPO: "https://github.com/SukiSU-Ultra/SukiSU_patch.git"
   SUKISU_HOOKS_PATCH: "hooks/scope_min_manual_hooks_v1.6.patch"
 
+  # --- ReSukiSU pairing (auto manual-hooks; reuses simonpunk SUSFS v1.5.11) ---
+  RESUKISU_REF: "main"
+  RESUKISU_COMMIT: "4f2e69f79674df8e53c2165bb1633ad6130184ed"      # ReSukiSU main
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -113,50 +122,67 @@ jobs:
           head -4 kernel/Makefile
 
       # --------------------------------------------------------------------
-      # Cache the toolchain so it's downloaded/patched only once (static key =
-      # pinned toolchain; bump v1->v2 to force a refresh).
+      # Cache the toolchain so it's downloaded/patched only once (bump the key
+      # suffix to force a refresh).
       - name: Cache Neutron Clang
         id: cache-clang
         uses: actions/cache@v4
         with:
           path: clang
-          key: neutron-clang-v1
+          key: neutron-clang-v2
 
-      - name: Set up Neutron Clang toolchain
-        if: steps.cache-clang.outputs.cache-hit != 'true'
+      # Validate the (possibly cached) toolchain and re-download if it's missing
+      # or broken — a restored-but-broken clang is what caused the
+      # "ccache clang: unknown C compiler" failure.
+      - name: Set up / verify Neutron Clang
         run: |
-          mkdir -p clang && cd clang
-          curl -LSs -o antman "https://raw.githubusercontent.com/Neutron-Toolchains/antman/main/antman"
-          chmod +x antman
-          ./antman -S                 # sync latest stable Neutron clang
-          ./antman --patch=glibc      # patch for the runner's newer glibc
-
-      - name: Export Clang to PATH
-        run: |
+          ok=0
+          if [ -x clang/bin/clang ] && clang/bin/clang -E -x c /dev/null >/dev/null 2>&1; then
+            ok=1
+          fi
+          if [ "$ok" != 1 ]; then
+            echo "Cached clang missing/broken — downloading fresh Neutron clang."
+            rm -rf clang && mkdir -p clang && cd clang
+            curl -LSs -o antman "https://raw.githubusercontent.com/Neutron-Toolchains/antman/main/antman"
+            chmod +x antman
+            ./antman -S
+            ./antman --patch=glibc
+            cd ..
+          else
+            echo "Cached Neutron clang verified."
+          fi
           echo "$GITHUB_WORKSPACE/clang/bin" >> "$GITHUB_PATH"
-          "$GITHUB_WORKSPACE/clang/bin/clang" --version | head -1
+          clang/bin/clang --version | head -1
+          # hard gate: must be detectable as a C compiler
+          clang/bin/clang -E -x c /dev/null >/dev/null
 
       # ===================== KernelSU-Next path =====================
       - name: Add KernelSU-Next
         if: github.event.inputs.root_variant == 'KernelSU-Next'
         working-directory: kernel
         run: |
-          # The a14-6.1-dev branch bundles the KSU-side SusFS integration.
-          curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" \
-            | bash -s "$KSUN_REF"
-          # Pin to the matched commit (fails loudly if upstream moved past it).
-          ( cd KernelSU-Next && git fetch --depth 1 origin "$KSUN_COMMIT" \
-              && git checkout -q "$KSUN_COMMIT" )
-          echo "KSU-Next pinned @ $KSUN_COMMIT"
-          # Guard: setup.sh silently falls back to a non-SusFS branch on a bad ref.
-          if ! grep -q "config KSU_SUSFS" KernelSU-Next/kernel/Kconfig; then
-            echo "::error::KernelSU-Next checked out without SusFS support."
-            exit 1
+          # With SusFS: the a14-6.1-dev branch bundles the KSU-side SusFS code.
+          # Without SusFS: use the plain 'next' branch (the susfs branch won't
+          # compile without the kernel-side SusFS patch).
+          if [ "${{ github.event.inputs.enable_susfs }}" = "true" ]; then
+            REF="$KSUN_REF"; PIN="$KSUN_COMMIT"
+          else
+            REF="next"; PIN=""
           fi
-          echo "Verified: KSU_SUSFS present in KernelSU-Next Kconfig."
+          curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" \
+            | bash -s "$REF"
+          if [ -n "$PIN" ]; then
+            ( cd KernelSU-Next && git fetch --depth 1 origin "$PIN" && git checkout -q "$PIN" )
+            echo "KSU-Next pinned @ $PIN"
+          fi
+          if [ "${{ github.event.inputs.enable_susfs }}" = "true" ]; then
+            grep -q "config KSU_SUSFS" KernelSU-Next/kernel/Kconfig \
+              || { echo "::error::KernelSU-Next checked out without SusFS support."; exit 1; }
+            echo "Verified: KSU_SUSFS present."
+          fi
 
       - name: Apply SusFS (KernelSU-Next · simonpunk v1.5.11)
-        if: github.event.inputs.root_variant == 'KernelSU-Next'
+        if: github.event.inputs.root_variant == 'KernelSU-Next' && github.event.inputs.enable_susfs == 'true'
         working-directory: kernel
         run: |
           mkdir -p ../susfs4ksu && cd ../susfs4ksu
@@ -179,11 +205,10 @@ jobs:
               && git checkout -q "$SUKISU_COMMIT" )
           echo "SukiSU-Ultra pinned @ $SUKISU_COMMIT"
 
-      - name: Apply SusFS + manual hooks (SukiSU-Ultra · ShirkNeko)
-        if: github.event.inputs.root_variant == 'SukiSU-Ultra'
+      - name: Apply SusFS (SukiSU-Ultra · ShirkNeko)
+        if: github.event.inputs.root_variant == 'SukiSU-Ultra' && github.event.inputs.enable_susfs == 'true'
         working-directory: kernel
         run: |
-          # SusFS kernel side (ShirkNeko fork, matched to SukiSU)
           mkdir -p ../susfs4ksu && cd ../susfs4ksu
           git init -q; git remote add origin "$SUKISU_SUSFS_REPO"
           git fetch -q --depth 1 origin "$SUKISU_SUSFS_COMMIT"; git checkout -q FETCH_HEAD
@@ -192,10 +217,39 @@ jobs:
           cp ../susfs4ksu/kernel_patches/include/linux/* include/linux/
           patch -p1 --fuzz=3 < "../susfs4ksu/kernel_patches/50_add_susfs_in_${SUSFS_BRANCH}.patch"
 
-          # SukiSU uses manual syscall hooks (not kprobes) — apply the hook patch.
+      - name: Apply SukiSU manual hooks
+        if: github.event.inputs.root_variant == 'SukiSU-Ultra'
+        working-directory: kernel
+        run: |
+          # SukiSU uses manual syscall hooks (not kprobes) — always required.
           git clone --depth 1 "$SUKISU_PATCH_REPO" ../SukiSU_patch
           cp "../SukiSU_patch/$SUKISU_HOOKS_PATCH" ./sukisu_hooks.patch
           patch -p1 -F 3 < ./sukisu_hooks.patch
+
+      # ===================== ReSukiSU path =====================
+      - name: Add ReSukiSU
+        if: github.event.inputs.root_variant == 'ReSukiSU'
+        working-directory: kernel
+        run: |
+          curl -LSs "https://raw.githubusercontent.com/ReSukiSU/ReSukiSU/main/kernel/setup.sh" \
+            | bash -s "$RESUKISU_REF"
+          ( cd KernelSU && git fetch --depth 1 origin "$RESUKISU_COMMIT" \
+              && git checkout -q "$RESUKISU_COMMIT" )
+          echo "ReSukiSU pinned @ $RESUKISU_COMMIT"
+
+      - name: Apply SusFS (ReSukiSU · simonpunk v1.5.11)
+        if: github.event.inputs.root_variant == 'ReSukiSU' && github.event.inputs.enable_susfs == 'true'
+        working-directory: kernel
+        run: |
+          # ReSukiSU auto-inserts its manual hooks via Kconfig (no source hook
+          # patch needed on android14-6.1). Only the kernel-side SusFS is patched.
+          mkdir -p ../susfs4ksu && cd ../susfs4ksu
+          git init -q; git remote add origin "$KSUN_SUSFS_REPO"
+          git fetch -q --depth 1 origin "$KSUN_SUSFS_COMMIT"; git checkout -q FETCH_HEAD
+          cd "$GITHUB_WORKSPACE/kernel"
+          cp ../susfs4ksu/kernel_patches/fs/* fs/
+          cp ../susfs4ksu/kernel_patches/include/linux/* include/linux/
+          patch -p1 --fuzz=3 < "../susfs4ksu/kernel_patches/50_add_susfs_in_${SUSFS_BRANCH}.patch"
 
       # ===================== Common: inject Kconfig =====================
       - name: Inject KSU + SusFS Kconfig into gki_defconfig
@@ -205,8 +259,13 @@ jobs:
           cat >> "$DEFCONFIG" <<'EOF'
           # --- build with newer Neutron clang: don't fail on new warnings ---
           # CONFIG_WERROR is not set
-          # --- KernelSU (KSU-Next & SukiSU both use CONFIG_KSU) ---
+          # --- KernelSU (all variants use CONFIG_KSU) ---
           CONFIG_KSU=y
+          EOF
+
+          # SusFS Kconfig — only when enabled.
+          if [ "${{ github.event.inputs.enable_susfs }}" = "true" ]; then
+            cat >> "$DEFCONFIG" <<'EOF'
           # --- SusFS ---
           CONFIG_KSU_SUSFS=y
           CONFIG_KSU_SUSFS_SUS_PATH=y
@@ -223,13 +282,25 @@ jobs:
           CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y
           CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
           EOF
+          else
+            echo "SusFS disabled — building root-only."
+          fi
 
-          # SukiSU needs manual-hook mode; KPM optional.
-          if [ "${{ github.event.inputs.root_variant }}" = "SukiSU-Ultra" ]; then
+          # Variant-specific hook config (independent of SusFS).
+          RV="${{ github.event.inputs.root_variant }}"
+          if [ "$RV" = "SukiSU-Ultra" ]; then
             echo "CONFIG_KSU_MANUAL_HOOK=y" >> "$DEFCONFIG"
             if [ "${{ github.event.inputs.enable_kpm }}" = "true" ]; then
               echo "CONFIG_KPM=y" >> "$DEFCONFIG"
             fi
+          elif [ "$RV" = "ReSukiSU" ]; then
+            # ReSukiSU: manual hooks auto-inserted via these Kconfig switches.
+            cat >> "$DEFCONFIG" <<'EOF'
+          CONFIG_KSU_MANUAL_HOOK=y
+          CONFIG_KSU_MANUAL_HOOK_AUTO_SETUID_HOOK=y
+          CONFIG_KSU_MANUAL_HOOK_AUTO_INITRC_HOOK=y
+          CONFIG_KSU_MANUAL_HOOK_AUTO_INPUT_HOOK=y
+          EOF
           fi
 
       # --------------------------------------------------------------------
@@ -255,22 +326,33 @@ jobs:
           export CCACHE_MAXSIZE=5G
           export CCACHE_COMPILERCHECK=content
           ccache -z >/dev/null 2>&1 || true
-          # Neutron is an LLVM-only toolchain; LLVM=1 sets CC/LD/AR/etc.
-          # CC="ccache clang" routes compilation through ccache.
-          make O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 CC="ccache clang" gki_defconfig
-          make O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 CC="ccache clang" -j"$(nproc)" Image
+
+          # ccache "masquerade": prepend a dir with clang/clang++ -> ccache symlinks,
+          # then the real Neutron toolchain. LLVM=1 invokes plain `clang`, which now
+          # resolves to ccache, which in turn finds the real clang next in PATH.
+          # This avoids the fragile CC="ccache clang" compiler-detection that broke.
+          MASK="$GITHUB_WORKSPACE/cc-mask"
+          mkdir -p "$MASK"
+          ln -sf "$(command -v ccache)" "$MASK/clang"
+          ln -sf "$(command -v ccache)" "$MASK/clang++"
+          export PATH="$MASK:$GITHUB_WORKSPACE/clang/bin:$PATH"
+
+          make O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 gki_defconfig
+          make O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 -j"$(nproc)" Image
           echo "--- ccache stats ---"; ccache -s
           ls -lh out/arch/arm64/boot/Image
 
       # --------------------------------------------------------------------
       - name: Package with AnyKernel3
         run: |
-          # Short tag for the chosen root variant.
-          if [ "${{ github.event.inputs.root_variant }}" = "SukiSU-Ultra" ]; then
-            RV="SukiSU"
-          else
-            RV="KSU-Next"
-          fi
+          # Short tag for the chosen root variant + SusFS state.
+          case "${{ github.event.inputs.root_variant }}" in
+            SukiSU-Ultra) RV="SukiSU" ;;
+            ReSukiSU)     RV="ReSukiSU" ;;
+            *)            RV="KSU-Next" ;;
+          esac
+          if [ "${{ github.event.inputs.enable_susfs }}" = "true" ]; then SFX="-SusFS"; else SFX="-noSusFS"; fi
+          RV="${RV}${SFX}"
 
           git clone --depth=1 "$ANYKERNEL_REPO" AnyKernel3
           rm -rf AnyKernel3/.git AnyKernel3/.github AnyKernel3/README.md
@@ -299,11 +381,11 @@ jobs:
           split_boot;
           flash_boot;
           EOF
-          sed -i "s|__KERNEL_STRING__|Xeon · Nothing 3a Pro ${RV}+SusFS by prabh (resurrected21)|" \
+          sed -i "s|__KERNEL_STRING__|Xeon · Nothing 3a Pro ${RV} by prabh (resurrected21)|" \
             AnyKernel3/anykernel.sh
 
           cd AnyKernel3
-          ZIP="../Xeon-NP3aPro-${RV}-SusFS-$(date +%Y%m%d-%H%M).zip"
+          ZIP="../Xeon-NP3aPro-${RV}-$(date +%Y%m%d-%H%M).zip"
           zip -r9 "$ZIP" * -x '*.git*' README.md
           echo "ZIP_NAME=$(basename "$ZIP")" >> "$GITHUB_ENV"
 
@@ -328,7 +410,10 @@ jobs:
         id: bootimg
         if: github.event.inputs.stock_boot_url != '' || github.event.inputs.stock_firmware_url != ''
         run: |
-          if [ "${{ github.event.inputs.root_variant }}" = "SukiSU-Ultra" ]; then RV="SukiSU"; else RV="KSU-Next"; fi
+          case "${{ github.event.inputs.root_variant }}" in
+            SukiSU-Ultra) RV="SukiSU" ;; ReSukiSU) RV="ReSukiSU" ;; *) RV="KSU-Next" ;;
+          esac
+          if [ "${{ github.event.inputs.enable_susfs }}" = "true" ]; then RV="${RV}-SusFS"; else RV="${RV}-noSusFS"; fi
           mkdir -p bootwork && cd bootwork
 
           # magiskboot (host x86_64 tool) straight from the official Magisk APK.
@@ -382,10 +467,10 @@ jobs:
           ./magiskboot unpack stock_boot.img
           cp ../kernel/out/arch/arm64/boot/Image ./kernel        # swap in our kernel
           ./magiskboot repack stock_boot.img                     # -> new-boot.img
-          mv new-boot.img "../Xeon-NP3aPro-${RV}-SusFS-boot.img"
+          mv new-boot.img "../Xeon-NP3aPro-${RV}-boot.img"
           cd ..
-          echo "BOOT_IMG=Xeon-NP3aPro-${RV}-SusFS-boot.img" >> "$GITHUB_ENV"
-          ls -lh "Xeon-NP3aPro-${RV}-SusFS-boot.img"
+          echo "BOOT_IMG=Xeon-NP3aPro-${RV}-boot.img" >> "$GITHUB_ENV"
+          ls -lh "Xeon-NP3aPro-${RV}-boot.img"
 
       - name: Upload patched boot.img
         if: steps.bootimg.outcome == 'success'
