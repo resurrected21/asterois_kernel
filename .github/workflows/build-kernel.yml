@@ -33,6 +33,7 @@ on:
           - KernelSU-Next
           - SukiSU-Ultra
           - ReSukiSU
+          - All
         default: KernelSU-Next
       enable_kpm:
         description: "SukiSU only: enable KPM (Kernel Patch Module) support"
@@ -57,7 +58,7 @@ on:
 
 # Cancel an in-progress run if a newer one is started for the same ref.
 concurrency:
-  group: build-kernel-${{ github.ref }}-${{ github.event.inputs.root_variant }}
+  group: build-kernel-${{ github.ref }}
   cancel-in-progress: true
 
 permissions:
@@ -81,13 +82,32 @@ env:
   SUKISU_PATCH_REPO: "https://github.com/SukiSU-Ultra/SukiSU_patch.git"
   SUKISU_HOOKS_PATCH: "hooks/scope_min_manual_hooks_v1.6.patch"
 
-  # --- ReSukiSU pairing (auto manual-hooks; reuses simonpunk SUSFS v1.5.11) ---
+  # --- ReSukiSU pairing (simonpunk SUSFS v2.1.0 → auto-hooks, no hook patch) ---
   RESUKISU_REF: "main"
   RESUKISU_COMMIT: "4f2e69f79674df8e53c2165bb1633ad6130184ed"      # ReSukiSU main
+  RESUKISU_SUSFS_COMMIT: "25d87a06c2893c956fb8e5051816e9b381d1e750"  # simonpunk susfs v2.1.0
 
 jobs:
-  build:
+  # Build the variant matrix: a single pick → one entry; "All" → all three.
+  prep:
     runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set.outputs.matrix }}
+    steps:
+      - id: set
+        run: |
+          if [ "${{ github.event.inputs.root_variant }}" = "All" ]; then
+            echo 'matrix={"variant":["KernelSU-Next","SukiSU-Ultra","ReSukiSU"]}' >> "$GITHUB_OUTPUT"
+          else
+            echo "matrix={\"variant\":[\"${{ github.event.inputs.root_variant }}\"]}" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    needs: prep
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false   # one variant failing must not cancel the others
+      matrix: ${{ fromJSON(needs.prep.outputs.matrix) }}
     steps:
       # --------------------------------------------------------------------
       - name: Free up disk space
@@ -158,7 +178,7 @@ jobs:
 
       # ===================== KernelSU-Next path =====================
       - name: Add KernelSU-Next
-        if: github.event.inputs.root_variant == 'KernelSU-Next'
+        if: matrix.variant == 'KernelSU-Next'
         working-directory: kernel
         run: |
           # With SusFS: the a14-6.1-dev branch bundles the KSU-side SusFS code.
@@ -182,7 +202,7 @@ jobs:
           fi
 
       - name: Apply SusFS (KernelSU-Next · simonpunk v1.5.11)
-        if: github.event.inputs.root_variant == 'KernelSU-Next' && github.event.inputs.enable_susfs == 'true'
+        if: matrix.variant == 'KernelSU-Next' && github.event.inputs.enable_susfs == 'true'
         working-directory: kernel
         run: |
           mkdir -p ../susfs4ksu && cd ../susfs4ksu
@@ -195,7 +215,7 @@ jobs:
 
       # ===================== SukiSU-Ultra path =====================
       - name: Add SukiSU-Ultra
-        if: github.event.inputs.root_variant == 'SukiSU-Ultra'
+        if: matrix.variant == 'SukiSU-Ultra'
         working-directory: kernel
         run: |
           # 'builtin' branch = root compiled into the Image (no LKM needed).
@@ -206,7 +226,7 @@ jobs:
           echo "SukiSU-Ultra pinned @ $SUKISU_COMMIT"
 
       - name: Apply SusFS (SukiSU-Ultra · ShirkNeko)
-        if: github.event.inputs.root_variant == 'SukiSU-Ultra' && github.event.inputs.enable_susfs == 'true'
+        if: matrix.variant == 'SukiSU-Ultra' && github.event.inputs.enable_susfs == 'true'
         working-directory: kernel
         run: |
           mkdir -p ../susfs4ksu && cd ../susfs4ksu
@@ -218,7 +238,7 @@ jobs:
           patch -p1 --fuzz=3 < "../susfs4ksu/kernel_patches/50_add_susfs_in_${SUSFS_BRANCH}.patch"
 
       - name: Apply SukiSU manual hooks
-        if: github.event.inputs.root_variant == 'SukiSU-Ultra'
+        if: matrix.variant == 'SukiSU-Ultra'
         working-directory: kernel
         run: |
           # SukiSU uses manual syscall hooks (not kprobes) — always required.
@@ -228,7 +248,7 @@ jobs:
 
       # ===================== ReSukiSU path =====================
       - name: Add ReSukiSU
-        if: github.event.inputs.root_variant == 'ReSukiSU'
+        if: matrix.variant == 'ReSukiSU'
         working-directory: kernel
         run: |
           curl -LSs "https://raw.githubusercontent.com/ReSukiSU/ReSukiSU/main/kernel/setup.sh" \
@@ -237,15 +257,15 @@ jobs:
               && git checkout -q "$RESUKISU_COMMIT" )
           echo "ReSukiSU pinned @ $RESUKISU_COMMIT"
 
-      - name: Apply SusFS (ReSukiSU · simonpunk v1.5.11)
-        if: github.event.inputs.root_variant == 'ReSukiSU' && github.event.inputs.enable_susfs == 'true'
+      - name: Apply SusFS (ReSukiSU · simonpunk v2.1.0)
+        if: matrix.variant == 'ReSukiSU' && github.event.inputs.enable_susfs == 'true'
         working-directory: kernel
         run: |
-          # ReSukiSU auto-inserts its manual hooks via Kconfig (no source hook
-          # patch needed on android14-6.1). Only the kernel-side SusFS is patched.
+          # SusFS > 1.5.12 → ReSukiSU auto-inserts its manual hooks via Kconfig,
+          # so no source hook patch is needed. Only the kernel-side SusFS is patched.
           mkdir -p ../susfs4ksu && cd ../susfs4ksu
           git init -q; git remote add origin "$KSUN_SUSFS_REPO"
-          git fetch -q --depth 1 origin "$KSUN_SUSFS_COMMIT"; git checkout -q FETCH_HEAD
+          git fetch -q --depth 1 origin "$RESUKISU_SUSFS_COMMIT"; git checkout -q FETCH_HEAD
           cd "$GITHUB_WORKSPACE/kernel"
           cp ../susfs4ksu/kernel_patches/fs/* fs/
           cp ../susfs4ksu/kernel_patches/include/linux/* include/linux/
@@ -266,14 +286,15 @@ jobs:
           # SusFS Kconfig — only when enabled.
           if [ "${{ github.event.inputs.enable_susfs }}" = "true" ]; then
             cat >> "$DEFCONFIG" <<'EOF'
-          # --- SusFS ---
+          # --- SusFS (matched to the proven OnePlus android14-6.1 config) ---
           CONFIG_KSU_SUSFS=y
+          CONFIG_KSU_SUSFS_HAS_MAGIC_MOUNT=y
           CONFIG_KSU_SUSFS_SUS_PATH=y
           CONFIG_KSU_SUSFS_SUS_MOUNT=y
           CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT=y
           CONFIG_KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT=y
           CONFIG_KSU_SUSFS_SUS_KSTAT=y
-          CONFIG_KSU_SUSFS_SUS_OVERLAYFS=y
+          CONFIG_KSU_SUSFS_SUS_OVERLAYFS=n
           CONFIG_KSU_SUSFS_TRY_UMOUNT=y
           CONFIG_KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT=y
           CONFIG_KSU_SUSFS_SPOOF_UNAME=y
@@ -281,13 +302,15 @@ jobs:
           CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y
           CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y
           CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
+          CONFIG_KSU_SUSFS_SUS_MAP=y
+          CONFIG_KSU_SUSFS_SUS_SU=n
           EOF
           else
             echo "SusFS disabled — building root-only."
           fi
 
           # Variant-specific hook config (independent of SusFS).
-          RV="${{ github.event.inputs.root_variant }}"
+          RV="${{ matrix.variant }}"
           if [ "$RV" = "SukiSU-Ultra" ]; then
             echo "CONFIG_KSU_MANUAL_HOOK=y" >> "$DEFCONFIG"
             if [ "${{ github.event.inputs.enable_kpm }}" = "true" ]; then
@@ -310,9 +333,9 @@ jobs:
         uses: actions/cache@v4
         with:
           path: .ccache
-          key: ccache-${{ github.ref_name }}-${{ github.sha }}
+          key: ccache-${{ matrix.variant }}-${{ github.sha }}
           restore-keys: |
-            ccache-${{ github.ref_name }}-
+            ccache-${{ matrix.variant }}-
             ccache-
 
       - name: Build GKI kernel Image
@@ -346,7 +369,7 @@ jobs:
       - name: Package with AnyKernel3
         run: |
           # Short tag for the chosen root variant + SusFS state.
-          case "${{ github.event.inputs.root_variant }}" in
+          case "${{ matrix.variant }}" in
             SukiSU-Ultra) RV="SukiSU" ;;
             ReSukiSU)     RV="ReSukiSU" ;;
             *)            RV="KSU-Next" ;;
@@ -410,7 +433,7 @@ jobs:
         id: bootimg
         if: github.event.inputs.stock_boot_url != '' || github.event.inputs.stock_firmware_url != ''
         run: |
-          case "${{ github.event.inputs.root_variant }}" in
+          case "${{ matrix.variant }}" in
             SukiSU-Ultra) RV="SukiSU" ;; ReSukiSU) RV="ReSukiSU" ;; *) RV="KSU-Next" ;;
           esac
           if [ "${{ github.event.inputs.enable_susfs }}" = "true" ]; then RV="${RV}-SusFS"; else RV="${RV}-noSusFS"; fi
@@ -485,12 +508,13 @@ jobs:
         if: github.event.inputs.make_release == 'true'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: kernel-${{ github.run_number }}
-          name: "Nothing 3a Pro · ${{ github.event.inputs.root_variant }} + SusFS (build ${{ github.run_number }})"
+          # Per-variant tag so parallel matrix jobs don't race on one release.
+          tag_name: kernel-${{ github.run_number }}-${{ matrix.variant }}
+          name: "Nothing 3a Pro · ${{ matrix.variant }} + SusFS (build ${{ github.run_number }})"
           body: |
             Automated kernel build for **Nothing Phone (3a) Pro** [asteroids / sm7635].
 
-            - Root: **${{ github.event.inputs.root_variant }}** + SusFS
+            - Root: **${{ matrix.variant }}** + SusFS
             - Base: GKI android14-6.1 (6.1.x)
             - Flash the **AnyKernel3 zip** in recovery, **or** `fastboot flash boot` the boot.img (if attached).
 
