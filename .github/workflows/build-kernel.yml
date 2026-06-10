@@ -8,8 +8,9 @@ name: Build Kernel (Nothing 3a Pro · KSU-Next / SukiSU + SusFS)
 # The device boots a GKI kernel, so we only rebuild the generic GKI Image and
 # repack it via AnyKernel3 — vendor_boot / vendor_dlkm stay stock.
 #
-# Toolchain: Neutron Clang (self-contained, fetched via antman). The AOSP
-# googlesource subdir-archive endpoint returns HTTP 400, so we don't use it.
+# Toolchain: selectable — AOSP clang r487747c (the exact clang the stock kernel
+# used; best ABI/boot compatibility, from the android14-release branch) or
+# Neutron Clang (newer, fetched via antman).
 #
 # Versions are PINNED to matched pairings (avoids upstream drift / SusFS mismatch):
 #   KernelSU-Next : SUSFS v1.5.11 (simonpunk)  + KSU-Next a14-6.1-dev (2025-10)
@@ -35,12 +36,23 @@ on:
           - ReSukiSU
           - All
         default: KernelSU-Next
+      toolchain:
+        description: "Compiler: AOSP r487747c = stock-matched (best boot compat); Neutron = newer"
+        type: choice
+        options:
+          - AOSP-r487747c
+          - Neutron-Clang
+        default: AOSP-r487747c
       enable_kpm:
         description: "SukiSU only: enable KPM (Kernel Patch Module) support"
         type: boolean
         default: false
       enable_susfs:
         description: "Include SusFS (untick to build root-only, e.g. to isolate a bootloop)"
+        type: boolean
+        default: true
+      fast_build:
+        description: "Disable LTO for faster builds (~25-30% quicker; fine for testing)"
         type: boolean
         default: true
       stock_boot_url:
@@ -142,38 +154,40 @@ jobs:
           head -4 kernel/Makefile
 
       # --------------------------------------------------------------------
-      # Cache the toolchain so it's downloaded/patched only once (bump the key
-      # suffix to force a refresh).
-      - name: Cache Neutron Clang
+      # Cache the toolchain (per-compiler key) so it's fetched only once.
+      - name: Cache toolchain
         id: cache-clang
         uses: actions/cache@v4
         with:
           path: clang
-          key: neutron-clang-v2
+          key: toolchain-${{ github.event.inputs.toolchain }}-v1
 
-      # Validate the (possibly cached) toolchain and re-download if it's missing
-      # or broken — a restored-but-broken clang is what caused the
-      # "ccache clang: unknown C compiler" failure.
-      - name: Set up / verify Neutron Clang
+      # Validate the (possibly cached) toolchain; re-download if missing/broken.
+      # AOSP r487747c = the exact clang the stock kernel used (best ABI/boot
+      # compatibility). Neutron = newer, self-contained alternative.
+      - name: Set up / verify toolchain
         run: |
-          ok=0
+          TC="${{ github.event.inputs.toolchain }}"
           if [ -x clang/bin/clang ] && clang/bin/clang -E -x c /dev/null >/dev/null 2>&1; then
-            ok=1
-          fi
-          if [ "$ok" != 1 ]; then
-            echo "Cached clang missing/broken — downloading fresh Neutron clang."
-            rm -rf clang && mkdir -p clang && cd clang
-            curl -LSs -o antman "https://raw.githubusercontent.com/Neutron-Toolchains/antman/main/antman"
-            chmod +x antman
-            ./antman -S
-            ./antman --patch=glibc
-            cd ..
+            echo "Cached $TC verified."
           else
-            echo "Cached Neutron clang verified."
+            echo "Toolchain missing/broken — fetching $TC."
+            rm -rf clang && mkdir -p clang
+            if [ "$TC" = "Neutron-Clang" ]; then
+              ( cd clang
+                curl -LSs -o antman "https://raw.githubusercontent.com/Neutron-Toolchains/antman/main/antman"
+                chmod +x antman; ./antman -S; ./antman --patch=glibc )
+            else
+              # AOSP clang r487747c (android14-release), built for old glibc → runs as-is.
+              curl -L --fail -o aosp-clang.tgz \
+                "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/android14-release/clang-r487747c.tar.gz"
+              tar -xzf aosp-clang.tgz -C clang
+              rm -f aosp-clang.tgz
+            fi
           fi
           echo "$GITHUB_WORKSPACE/clang/bin" >> "$GITHUB_PATH"
           clang/bin/clang --version | head -1
-          # hard gate: must be detectable as a C compiler
+          # hard gate: must run and be detectable as a C compiler
           clang/bin/clang -E -x c /dev/null >/dev/null
 
       # ===================== KernelSU-Next path =====================
@@ -261,8 +275,6 @@ jobs:
         if: matrix.variant == 'ReSukiSU' && github.event.inputs.enable_susfs == 'true'
         working-directory: kernel
         run: |
-          # SusFS > 1.5.12 → ReSukiSU auto-inserts its manual hooks via Kconfig,
-          # so no source hook patch is needed. Only the kernel-side SusFS is patched.
           mkdir -p ../susfs4ksu && cd ../susfs4ksu
           git init -q; git remote add origin "$KSUN_SUSFS_REPO"
           git fetch -q --depth 1 origin "$RESUKISU_SUSFS_COMMIT"; git checkout -q FETCH_HEAD
@@ -270,6 +282,48 @@ jobs:
           cp ../susfs4ksu/kernel_patches/fs/* fs/
           cp ../susfs4ksu/kernel_patches/include/linux/* include/linux/
           patch -p1 --fuzz=3 < "../susfs4ksu/kernel_patches/50_add_susfs_in_${SUSFS_BRANCH}.patch"
+
+      # ReSukiSU requires ksu_handle_newfstat_ret + ksu_handle_fstat64_ret in
+      # fs/stat.c, which NO SusFS fork provides for android14-6.1. Inject them
+      # (plus ksu_handle_stat if SusFS wasn't applied). Runs after SusFS so it
+      # detects whether ksu_handle_stat already exists. Idempotent + tree-robust.
+      - name: Integrate ReSukiSU stat hooks (fs/stat.c)
+        if: matrix.variant == 'ReSukiSU'
+        working-directory: kernel
+        run: |
+          python3 - fs/stat.c <<'PY'
+          import re, sys
+          f = sys.argv[1]; s = open(f).read()
+          if "ksu_handle_newfstat_ret" in s:
+              print("already present; skipping"); sys.exit(0)
+          has_stat = "ksu_handle_stat" in s   # SusFS adds it; only add ours if missing
+          ext = "\n#ifdef CONFIG_KSU_MANUAL_HOOK\n"
+          if not has_stat:
+              ext += "extern int ksu_handle_stat(int *dfd, const char __user **filename_user, int *flags);\n"
+          ext += "extern void ksu_handle_newfstat_ret(unsigned int *fd, struct stat __user **statbuf_ptr);\n"
+          ext += "#if defined(__ARCH_WANT_STAT64) || defined(__ARCH_WANT_COMPAT_STAT64)\n"
+          ext += "extern void ksu_handle_fstat64_ret(unsigned long *fd, struct stat64 __user **statbuf_ptr);\n"
+          ext += "#endif\n#endif\n\n"
+          anchor = "#if defined(__ARCH_WANT_STAT64) || defined(__ARCH_WANT_COMPAT_STAT64)"
+          i = s.find(anchor); assert i != -1, "extern anchor missing"
+          s = s[:i] + ext + s[i:]
+          s, n = re.subn(r"(SYSCALL_DEFINE2\(fstat64,.*?cp_new_stat64\(&stat, statbuf\);\n)(\n\treturn error;)",
+              r"\1\n#ifdef CONFIG_KSU_MANUAL_HOOK\n\tksu_handle_fstat64_ret(&fd, &statbuf);\n#endif\2", s, count=1, flags=re.S)
+          assert n == 1, "fstat64 hook failed"
+          s, n = re.subn(r"(COMPAT_SYSCALL_DEFINE2\(newfstat,.*?cp_compat_stat\(&stat, statbuf\);\n)(\treturn error;)",
+              r"\1#ifdef CONFIG_KSU_MANUAL_HOOK\n\tksu_handle_newfstat_ret(&fd, (struct stat __user**)&statbuf);\n#endif\n\2", s, count=1, flags=re.S)
+          assert n == 1, "newfstat hook failed"
+          if not has_stat:
+              s, n = re.subn(r"(SYSCALL_DEFINE4\(newfstatat,.*?\n\tint error;\n)(\n\terror = vfs_fstatat)",
+                  r"\1\n#ifdef CONFIG_KSU_MANUAL_HOOK\n\tksu_handle_stat(&dfd, &filename, &flag);\n#endif\2", s, count=1, flags=re.S)
+              assert n == 1, "newfstatat stat hook failed"
+          open(f, "w").write(s)
+          print("ReSukiSU stat hooks integrated (had_susfs_stat=%s)" % has_stat)
+          PY
+          echo "verify (each should be >=1):"
+          for h in ksu_handle_stat ksu_handle_newfstat_ret ksu_handle_fstat64_ret; do
+            echo "  $h: $(grep -c "$h" fs/stat.c)"
+          done
 
       # ===================== Common: inject Kconfig =====================
       - name: Inject KSU + SusFS Kconfig into gki_defconfig
@@ -351,7 +405,7 @@ jobs:
           ccache -z >/dev/null 2>&1 || true
 
           # ccache "masquerade": prepend a dir with clang/clang++ -> ccache symlinks,
-          # then the real Neutron toolchain. LLVM=1 invokes plain `clang`, which now
+          # then the real toolchain. LLVM=1 invokes plain `clang`, which now
           # resolves to ccache, which in turn finds the real clang next in PATH.
           # This avoids the fragile CC="ccache clang" compiler-detection that broke.
           MASK="$GITHUB_WORKSPACE/cc-mask"
@@ -361,6 +415,15 @@ jobs:
           export PATH="$MASK:$GITHUB_WORKSPACE/clang/bin:$PATH"
 
           make O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 gki_defconfig
+
+          # Fast build: drop LTO (the slow thin-LTO link). Safe for testing.
+          if [ "${{ github.event.inputs.fast_build }}" = "true" ]; then
+            ./scripts/config --file out/.config \
+              -d LTO_CLANG_THIN -d LTO_CLANG_FULL -e LTO_NONE
+            make O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 olddefconfig
+            echo "LTO disabled for this build."
+          fi
+
           make O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 -j"$(nproc)" Image
           echo "--- ccache stats ---"; ccache -s
           ls -lh out/arch/arm64/boot/Image
