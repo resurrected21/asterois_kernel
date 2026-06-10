@@ -28,14 +28,22 @@ on:
         type: string
         default: "sm7635/b/mr_Frogger"
       root_variant:
-        description: "Root solution to build"
+        description: "Root solution (None = stock vanilla kernel, no root/SusFS)"
         type: choice
         options:
+          - None
           - KernelSU-Next
           - SukiSU-Ultra
           - ReSukiSU
           - All
         default: KernelSU-Next
+      output_type:
+        description: "What to produce"
+        type: choice
+        options:
+          - Zip only
+          - Zip + boot.img
+        default: Zip only
       toolchain:
         description: "Compiler: AOSP r487747c = stock-matched (best boot compat); Neutron = newer"
         type: choice
@@ -330,12 +338,18 @@ jobs:
         working-directory: kernel
         run: |
           DEFCONFIG=arch/arm64/configs/gki_defconfig
-          cat >> "$DEFCONFIG" <<'EOF'
-          # --- build with newer Neutron clang: don't fail on new warnings ---
-          # CONFIG_WERROR is not set
-          # --- KernelSU (all variants use CONFIG_KSU) ---
-          CONFIG_KSU=y
-          EOF
+          RV="${{ matrix.variant }}"
+
+          # Always relax -Werror so the build doesn't fail on new warnings.
+          echo "# CONFIG_WERROR is not set" >> "$DEFCONFIG"
+
+          # Stock vanilla build → no root, no SusFS, no hooks. Stop here.
+          if [ "$RV" = "None" ]; then
+            echo "Stock vanilla build — no root patches applied."
+            exit 0
+          fi
+
+          echo "CONFIG_KSU=y" >> "$DEFCONFIG"
 
           # SusFS Kconfig — only when enabled.
           if [ "${{ github.event.inputs.enable_susfs }}" = "true" ]; then
@@ -364,7 +378,6 @@ jobs:
           fi
 
           # Variant-specific hook config (independent of SusFS).
-          RV="${{ matrix.variant }}"
           if [ "$RV" = "SukiSU-Ultra" ]; then
             echo "CONFIG_KSU_MANUAL_HOOK=y" >> "$DEFCONFIG"
             if [ "${{ github.event.inputs.enable_kpm }}" = "true" ]; then
@@ -433,12 +446,15 @@ jobs:
         run: |
           # Short tag for the chosen root variant + SusFS state.
           case "${{ matrix.variant }}" in
+            None)         RV="Stock" ;;
             SukiSU-Ultra) RV="SukiSU" ;;
             ReSukiSU)     RV="ReSukiSU" ;;
             *)            RV="KSU-Next" ;;
           esac
-          if [ "${{ github.event.inputs.enable_susfs }}" = "true" ]; then SFX="-SusFS"; else SFX="-noSusFS"; fi
-          RV="${RV}${SFX}"
+          # No SusFS suffix for a stock build; otherwise reflect the toggle.
+          if [ "$RV" != "Stock" ]; then
+            if [ "${{ github.event.inputs.enable_susfs }}" = "true" ]; then RV="${RV}-SusFS"; else RV="${RV}-noSusFS"; fi
+          fi
 
           git clone --depth=1 "$ANYKERNEL_REPO" AnyKernel3
           rm -rf AnyKernel3/.git AnyKernel3/.github AnyKernel3/README.md
@@ -494,12 +510,14 @@ jobs:
       #   stock_firmware_url  — a firmware/OTA zip or payload.bin (auto-extracted).
       - name: Build patched boot.img
         id: bootimg
-        if: github.event.inputs.stock_boot_url != '' || github.event.inputs.stock_firmware_url != ''
+        if: github.event.inputs.output_type == 'Zip + boot.img' && (github.event.inputs.stock_boot_url != '' || github.event.inputs.stock_firmware_url != '')
         run: |
           case "${{ matrix.variant }}" in
-            SukiSU-Ultra) RV="SukiSU" ;; ReSukiSU) RV="ReSukiSU" ;; *) RV="KSU-Next" ;;
+            None) RV="Stock" ;; SukiSU-Ultra) RV="SukiSU" ;; ReSukiSU) RV="ReSukiSU" ;; *) RV="KSU-Next" ;;
           esac
-          if [ "${{ github.event.inputs.enable_susfs }}" = "true" ]; then RV="${RV}-SusFS"; else RV="${RV}-noSusFS"; fi
+          if [ "$RV" != "Stock" ]; then
+            if [ "${{ github.event.inputs.enable_susfs }}" = "true" ]; then RV="${RV}-SusFS"; else RV="${RV}-noSusFS"; fi
+          fi
           mkdir -p bootwork && cd bootwork
 
           # magiskboot (host x86_64 tool) straight from the official Magisk APK.
