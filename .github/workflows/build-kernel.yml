@@ -81,7 +81,7 @@ jobs:
           echo "KERNEL_REPO=https://github.com/NothingOSS/android_kernel_msm-6.1_nothing_sm7635" >> $GITHUB_ENV
           echo "KERNEL_BRANCH=sm7635/b/mr_Frogger" >> $GITHUB_ENV
           echo "DEVICE_PROJECT=Asteroids" >> $GITHUB_ENV
-          echo "SOC=volcano" >> $GITHUB_ENV
+          echo "SOC=pitti" >> $GITHUB_ENV
           echo "SUSFS_BRANCH=gki-android14-6.1" >> $GITHUB_ENV
           echo "AOSP_CLANG_URL=https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/android14-release/clang-r487747c.tar.gz" >> $GITHUB_ENV
           
