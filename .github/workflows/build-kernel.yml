@@ -442,6 +442,39 @@ jobs:
           ls -lh out/arch/arm64/boot/Image
 
       # --------------------------------------------------------------------
+      # Record exactly what was built (version/variant/toolchain/source) into
+      # build-info.txt — bundled in the zip and shown in the release notes.
+      - name: Collect build info
+        working-directory: kernel
+        run: |
+          RV="${{ matrix.variant }}"
+          # Prefer the real version string baked into the Image; fall back to make.
+          KVER="$(strings out/arch/arm64/boot/Image 2>/dev/null | grep -m1 'Linux version' || true)"
+          [ -z "$KVER" ] && KVER="$(make -s kernelrelease O=out 2>/dev/null | tail -1)"
+          SRC_SHA="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
+          KSU_DIR="$([ -d KernelSU-Next ] && echo KernelSU-Next || echo KernelSU)"
+          KSU_VER="$([ -d "$KSU_DIR/.git" ] && git -C "$KSU_DIR" describe --tags --always 2>/dev/null || echo '-')"
+          LTO="$([ "${{ github.event.inputs.fast_build }}" = "true" ] && echo disabled || echo enabled)"
+          {
+            echo "=========================================================="
+            echo " Xeon · Nothing 3a Pro (asteroids/sm7635) kernel build"
+            echo "=========================================================="
+            echo "Built     : $(date -u '+%Y-%m-%d %H:%M UTC')  (run #${{ github.run_number }})"
+            echo "Kernel    : ${KVER:-unknown}"
+            echo "Root      : ${RV}${{ github.event.inputs.enable_susfs == 'true' && ' + SusFS' || '' }}"
+            echo "Root ver  : ${KSU_VER}"
+            echo "SusFS     : ${{ github.event.inputs.enable_susfs }}"
+            echo "Toolchain : ${{ github.event.inputs.toolchain }} — $(clang --version | head -1)"
+            echo "LTO       : ${LTO}"
+            echo "Source    : ${{ github.event.inputs.kernel_repo }}"
+            echo "Branch    : ${{ github.event.inputs.kernel_branch }} @ ${SRC_SHA}"
+            echo "Config    : gki_defconfig (+ root/SusFS Kconfig)"
+            echo "By        : prabh (resurrected21)"
+          } | tee "$GITHUB_WORKSPACE/build-info.txt"
+          # Expose the one-line kernel version for the release body.
+          echo "KVER_LINE=${KVER:-unknown}" >> "$GITHUB_ENV"
+
+      # --------------------------------------------------------------------
       - name: Package with AnyKernel3
         run: |
           # Short tag for the chosen root variant + SusFS state.
@@ -459,6 +492,7 @@ jobs:
           git clone --depth=1 "$ANYKERNEL_REPO" AnyKernel3
           rm -rf AnyKernel3/.git AnyKernel3/.github AnyKernel3/README.md
           cp kernel/out/arch/arm64/boot/Image AnyKernel3/Image
+          cp build-info.txt AnyKernel3/build-info.txt   # traceability inside the zip
 
           # Minimal GKI anykernel.sh (boot partition, A/B, no dtb repack)
           cat > AnyKernel3/anykernel.sh <<'EOF'
@@ -591,13 +625,17 @@ jobs:
         with:
           # Per-variant tag so parallel matrix jobs don't race on one release.
           tag_name: kernel-${{ github.run_number }}-${{ matrix.variant }}
-          name: "Nothing 3a Pro · ${{ matrix.variant }} + SusFS (build ${{ github.run_number }})"
+          name: "Nothing 3a Pro · ${{ matrix.variant }}${{ github.event.inputs.enable_susfs == 'true' && ' + SusFS' || '' }} (build ${{ github.run_number }})"
           body: |
             Automated kernel build for **Nothing Phone (3a) Pro** [asteroids / sm7635].
 
-            - Root: **${{ matrix.variant }}** + SusFS
-            - Base: GKI android14-6.1 (6.1.x)
+            - Root: **${{ matrix.variant }}**${{ github.event.inputs.enable_susfs == 'true' && ' + SusFS' || ' (no SusFS)' }}
+            - Kernel: `${{ env.KVER_LINE }}`
+            - Toolchain: ${{ github.event.inputs.toolchain }}
+            - Config: `gki_defconfig` (+ root/SusFS Kconfig)
             - Flash the **AnyKernel3 zip** in recovery, **or** `fastboot flash boot` the boot.img (if attached).
+
+            Full build details are in `build-info.txt` (inside the zip).
 
             ⚠️ Unlocked bootloader required. First KSU flash wipes data (`fastboot -w`). Back up first.
           files: |
