@@ -49,6 +49,15 @@ on:
         description: 'Stock source for boot.img: firmware .7z/.zip/payload.bin OR a direct boot.img URL'
         required: false
         default: ''
+      make_release:
+        description: 'Publish a Release with RAW files (real .zip + .img, no double-zip)'
+        required: true
+        default: 'y'
+        type: choice
+        options: ['y', 'n']
+
+permissions:
+  contents: write   # needed to publish the Release
 
 jobs:
   build:
@@ -344,11 +353,17 @@ jobs:
           zip -r9 "$ZIP_NAME" . -x '*.git*' README.md >/dev/null
           mv "$ZIP_NAME" ${{ env.ROOT }}/
 
-      - name: Upload Kernel Artifact
+      # Upload the AnyKernel3 FOLDER (not the pre-made .zip). GitHub always zips
+      # an artifact on download — so uploading the folder means the downloaded
+      # artifact IS the flashable AnyKernel3 zip (anykernel.sh at root), instead
+      # of a useless zip-inside-a-zip.
+      - name: Upload flashable AnyKernel3 (artifact = the flashable zip)
         uses: actions/upload-artifact@v4
         with:
-          name: Xeon-Kernel-Asteroids-${{ env.RVTAG }}-${{ env.STAMP }}
-          path: ${{ env.ROOT }}/*.zip
+          name: Xeon-NP3aPro-${{ env.RVTAG }}-${{ env.STAMP }}
+          path: |
+            ${{ env.AK3 }}/*
+            !${{ env.AK3 }}/*.git*
 
       # Optional: swap our kernel into your STOCK boot.img → fastboot-flashable.
       # Handles .7z / .zip / .gz / .img / payload.bin. Skipped unless you pick
@@ -399,10 +414,32 @@ jobs:
           mv new-boot.img "${{ env.ROOT }}/Xeon-NP3aPro-${{ env.RVTAG }}-boot.img"
           ls -lh "${{ env.ROOT }}/Xeon-NP3aPro-${{ env.RVTAG }}-boot.img"
 
-      - name: Upload boot.img
+      - name: Upload boot.img artifact (GitHub wraps it in a zip)
         if: steps.bootimg.outcome == 'success'
         uses: actions/upload-artifact@v4
         with:
           name: Xeon-NP3aPro-${{ env.RVTAG }}-boot-${{ env.STAMP }}
           path: ${{ env.ROOT }}/*-boot.img
           if-no-files-found: error
+
+      # Release assets are stored RAW (no zip wrapping) — this is where you get a
+      # real flashable .zip and a real .img. Needs the repo setting:
+      # Settings → Actions → General → Workflow permissions → "Read and write".
+      - name: Publish Release (RAW .zip + .img)
+        if: github.event.inputs.make_release == 'y'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: asteroid-${{ env.RVTAG }}-${{ env.STAMP }}
+          name: "Nothing 3a Pro · ${{ env.RVTAG }} (${{ env.STAMP }})"
+          body: |
+            Standalone GKI 6.1.x kernel for Nothing Phone (3a) Pro [asteroids/sm7635].
+            Variant: **${{ env.RVTAG }}** · Toolchain: ${{ github.event.inputs.toolchain }}
+
+            - **`.zip`** — flash in recovery / root-manager (AnyKernel3).
+            - **`.img`** — `fastboot flash boot` (only present if you chose Zip + boot.img).
+
+            Build details are in `build-info.txt` inside the zip.
+          files: |
+            ${{ env.ROOT }}/*.zip
+            ${{ env.ROOT }}/*-boot.img
+          fail_on_unmatched_files: false
