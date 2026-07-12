@@ -97,10 +97,10 @@ jobs:
           echo "SUSFS_BRANCH=gki-android14-6.1" >> $GITHUB_ENV
           echo "AOSP_CLANG_URL=https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/android14-release/clang-r487747c.tar.gz" >> $GITHUB_ENV
 
-          echo "KSUN_REF=next-susfs-a14-6.1-dev" >> $GITHUB_ENV
-          echo "KSUN_COMMIT=575d27f046f26f1081000e7ddd8b019e1bd39fb1" >> $GITHUB_ENV
+          echo "KSUN_REF=dev-susfs" >> $GITHUB_ENV
+          echo "KSUN_COMMIT=9eeb0053bfba77d1a350f4de51707894ba3a9284" >> $GITHUB_ENV
           echo "KSUN_SUSFS_REPO=https://gitlab.com/simonpunk/susfs4ksu.git" >> $GITHUB_ENV
-          echo "KSUN_SUSFS_COMMIT=95348c38587f8213c86af17f9fcca01cab268d64" >> $GITHUB_ENV
+          echo "KSUN_SUSFS_COMMIT=8199bb6534174117ad907f726231484872ac345a" >> $GITHUB_ENV
           echo "SUKISU_REF=builtin" >> $GITHUB_ENV
           echo "SUKISU_COMMIT=6c13a0695a1115e1000c998872b66f4ff5b2f11e" >> $GITHUB_ENV
           echo "SUKISU_SUSFS_REPO=https://github.com/ShirkNeko/susfs4ksu.git" >> $GITHUB_ENV
@@ -171,8 +171,14 @@ jobs:
           }
           case "$VARIANT" in
             KernelSU-Next)
-              if [ "$SUSFS" = "y" ]; then REF="${{ env.KSUN_REF }}"; else REF=next; fi
-              curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -s "$REF"
+              if [ "$SUSFS" = "y" ]; then
+                REF="${{ env.KSUN_REF }}"
+                SETUP="https://raw.githubusercontent.com/pershoot/KernelSU-Next/dev-susfs/kernel/setup.sh"
+              else
+                REF=next
+                SETUP="https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh"
+              fi
+              curl -LSs "$SETUP" | bash -s "$REF"
               if [ "$SUSFS" = "y" ]; then
                 ( cd KernelSU-Next && git fetch --depth 1 origin "${{ env.KSUN_COMMIT }}" && git checkout -q "${{ env.KSUN_COMMIT }}" )
                 apply_susfs "${{ env.KSUN_SUSFS_REPO }}" "${{ env.KSUN_SUSFS_COMMIT }}" susfs-simonpunk
