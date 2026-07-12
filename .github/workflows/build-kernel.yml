@@ -1,5 +1,11 @@
 name: Build Asteroid Kernel
 
+# Standalone GKI android14-6.1 build for Nothing Phone (3a) Pro [asteroids/sm7635].
+# Config: gki_defconfig ONLY (+ root/SusFS Kconfig) — matches the stock generic
+# GKI Image. Vendor fragments are intentionally NOT merged (they'd change the
+# Image's KMI and risk breaking stock vendor_dlkm module loading).
+# Output: flashable AnyKernel3 zip (no stock boot.img required).
+
 on:
   workflow_dispatch:
     inputs:
@@ -8,43 +14,31 @@ on:
         required: true
         default: 'KernelSU-Next'
         type: choice
-        options:
-          - 'KernelSU-Next'
-          - 'SukiSU-Ultra'
-          - 'ReSukiSU'
-          - 'None'
+        options: ['KernelSU-Next', 'SukiSU-Ultra', 'ReSukiSU', 'None']
       susfs:
         description: 'Include SusFS? (Ignored if Variant is None)'
         required: true
         default: 'y'
         type: choice
-        options:
-          - 'y'
-          - 'n'
+        options: ['y', 'n']
       kpm:
-        description: 'Enable KPM? (Only applicable for SukiSU-Ultra)'
+        description: 'Enable KPM? (SukiSU-Ultra only)'
         required: true
         default: 'n'
         type: choice
-        options:
-          - 'y'
-          - 'n'
+        options: ['y', 'n']
       toolchain:
         description: 'Compiler Toolchain'
         required: true
         default: 'aosp'
         type: choice
-        options:
-          - 'aosp'
-          - 'neutron'
+        options: ['aosp', 'neutron']
       disable_lto:
-        description: 'Disable LTO for faster build compilation?'
+        description: 'Disable LTO for faster compilation?'
         required: true
         default: 'y'
         type: choice
-        options:
-          - 'y'
-          - 'n'
+        options: ['y', 'n']
 
 jobs:
   build:
@@ -73,18 +67,17 @@ jobs:
           echo "KSRC=$GITHUB_WORKSPACE/workspace/kernel" >> $GITHUB_ENV
           echo "OUT=$GITHUB_WORKSPACE/workspace/out" >> $GITHUB_ENV
           echo "TCROOT=$GITHUB_WORKSPACE/workspace/toolchain" >> $GITHUB_ENV
+          echo "TCDIR=$GITHUB_WORKSPACE/workspace/toolchain/${{ github.event.inputs.toolchain }}" >> $GITHUB_ENV
           echo "TOOLS=$GITHUB_WORKSPACE/workspace/tools" >> $GITHUB_ENV
           echo "CACHE=$GITHUB_WORKSPACE/workspace/cache" >> $GITHUB_ENV
           echo "AK3=$GITHUB_WORKSPACE/workspace/AnyKernel3" >> $GITHUB_ENV
           echo "CCDIR=$GITHUB_WORKSPACE/workspace/.ccache" >> $GITHUB_ENV
-          
+
           echo "KERNEL_REPO=https://github.com/NothingOSS/android_kernel_msm-6.1_nothing_sm7635" >> $GITHUB_ENV
           echo "KERNEL_BRANCH=sm7635/b/mr_Frogger" >> $GITHUB_ENV
-          echo "DEVICE_PROJECT=Asteroids" >> $GITHUB_ENV
-          echo "SOC=pitti" >> $GITHUB_ENV
           echo "SUSFS_BRANCH=gki-android14-6.1" >> $GITHUB_ENV
           echo "AOSP_CLANG_URL=https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/android14-release/clang-r487747c.tar.gz" >> $GITHUB_ENV
-          
+
           echo "KSUN_REF=next-susfs-a14-6.1-dev" >> $GITHUB_ENV
           echo "KSUN_COMMIT=575d27f046f26f1081000e7ddd8b019e1bd39fb1" >> $GITHUB_ENV
           echo "KSUN_SUSFS_REPO=https://gitlab.com/simonpunk/susfs4ksu.git" >> $GITHUB_ENV
@@ -100,124 +93,126 @@ jobs:
           echo "RESUKISU_SUSFS_COMMIT=25d87a06c2893c956fb8e5051816e9b381d1e750" >> $GITHUB_ENV
 
       - name: Prepare Workspace Directories
-        run: |
-          mkdir -p ${{ env.ROOT }} ${{ env.OUT }} ${{ env.TCROOT }} ${{ env.TOOLS }} ${{ env.CACHE }} ${{ env.CCDIR }}
+        run: mkdir -p ${{ env.ROOT }} ${{ env.OUT }} ${{ env.TCROOT }} ${{ env.TOOLS }} ${{ env.CACHE }} ${{ env.CCDIR }}
+
+      # Cache the toolchain across runs (per compiler). Restores before fetch.
+      - name: Cache Toolchain
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.TCDIR }}
+          key: toolchain-${{ github.event.inputs.toolchain }}-v1
 
       - name: Fetch Toolchain
         run: |
-          TCDIR="${{ env.TCROOT }}/${{ github.event.inputs.toolchain }}"
-          mkdir -p "$TCDIR"
-          if [ "${{ github.event.inputs.toolchain }}" = "neutron" ]; then
-            cd "$TCDIR"
-            curl -LSs -o antman "https://raw.githubusercontent.com/Neutron-Toolchains/antman/main/antman"
-            chmod +x antman
-            ./antman -S
-            ./antman --patch=glibc
+          if [ -x "${{ env.TCDIR }}/bin/clang" ] && "${{ env.TCDIR }}/bin/clang" --version >/dev/null 2>&1; then
+            echo "Reusing cached toolchain."
           else
-            curl -L --fail -o /tmp/aosp-clang.tgz "${{ env.AOSP_CLANG_URL }}"
-            tar -xzf /tmp/aosp-clang.tgz -C "$TCDIR"
-            rm -f /tmp/aosp-clang.tgz
+            echo "Fetching ${{ github.event.inputs.toolchain }} toolchain..."
+            rm -rf "${{ env.TCDIR }}"; mkdir -p "${{ env.TCDIR }}"
+            if [ "${{ github.event.inputs.toolchain }}" = "neutron" ]; then
+              ( cd "${{ env.TCDIR }}"
+                curl -LSs -o antman "https://raw.githubusercontent.com/Neutron-Toolchains/antman/main/antman"
+                chmod +x antman; ./antman -S; ./antman --patch=glibc )
+            else
+              curl -L --fail -o /tmp/aosp-clang.tgz "${{ env.AOSP_CLANG_URL }}"
+              tar -xzf /tmp/aosp-clang.tgz -C "${{ env.TCDIR }}"; rm -f /tmp/aosp-clang.tgz
+            fi
           fi
-          echo "TCDIR=$TCDIR" >> $GITHUB_ENV
+          "${{ env.TCDIR }}/bin/clang" --version | head -1
 
       - name: Clone Kernel Source
-        run: |
-          git clone --depth=1 -b ${{ env.KERNEL_BRANCH }} ${{ env.KERNEL_REPO }} ${{ env.KSRC }}
+        run: git clone --depth=1 -b ${{ env.KERNEL_BRANCH }} ${{ env.KERNEL_REPO }} ${{ env.KSRC }}
 
       - name: Generate Identity Tag
         run: |
-          VARIANT="${{ github.event.inputs.variant }}"
-          SUSFS="${{ github.event.inputs.susfs }}"
+          VARIANT="${{ github.event.inputs.variant }}"; SUSFS="${{ github.event.inputs.susfs }}"
           if [ "$VARIANT" = "None" ]; then
             RVTAG="Stock"
           else
-            if [ "$VARIANT" = "SukiSU-Ultra" ]; then RVTAG="SukiSU"; fi
-            if [ "$VARIANT" = "ReSukiSU" ]; then RVTAG="ReSukiSU"; fi
-            if [ "$VARIANT" = "KernelSU-Next" ]; then RVTAG="KSU-Next"; fi
-            if [ "$SUSFS" = "y" ]; then RVTAG="${RVTAG}-SusFS"; else RVTAG="${RVTAG}-noSusFS"; fi
+            case "$VARIANT" in
+              SukiSU-Ultra) RVTAG="SukiSU" ;; ReSukiSU) RVTAG="ReSukiSU" ;; *) RVTAG="KSU-Next" ;;
+            esac
+            [ "$SUSFS" = "y" ] && RVTAG="${RVTAG}-SusFS" || RVTAG="${RVTAG}-noSusFS"
           fi
           echo "RVTAG=$RVTAG" >> $GITHUB_ENV
           echo "STAMP=$(date +%Y%m%d-%H%M)" >> $GITHUB_ENV
 
-      - name: Apply Root Frameworks and Patches
+      - name: Apply Root Frameworks
         run: |
           cd ${{ env.KSRC }}
-          VARIANT="${{ github.event.inputs.variant }}"
-          SUSFS="${{ github.event.inputs.susfs }}"
-          
+          VARIANT="${{ github.event.inputs.variant }}"; SUSFS="${{ github.event.inputs.susfs }}"
           apply_susfs() {
             local repo="$1" commit="$2" d="${{ env.CACHE }}/$3"
-            git init -q "$d" && git -C "$d" remote add origin "$repo"
+            git init -q "$d"; git -C "$d" remote add origin "$repo" 2>/dev/null || true
             git -C "$d" fetch -q --depth 1 origin "$commit"
             git -C "$d" -c advice.detachedHead=false checkout -q FETCH_HEAD
             cp "$d"/kernel_patches/fs/* fs/
             cp "$d"/kernel_patches/include/linux/* include/linux/
             patch -p1 --fuzz=3 < "$d/kernel_patches/50_add_susfs_in_${{ env.SUSFS_BRANCH }}.patch"
           }
-
           case "$VARIANT" in
             KernelSU-Next)
               if [ "$SUSFS" = "y" ]; then REF="${{ env.KSUN_REF }}"; else REF=next; fi
               curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -s "$REF"
               if [ "$SUSFS" = "y" ]; then
-                cd KernelSU-Next && git fetch --depth 1 origin "${{ env.KSUN_COMMIT }}" && git checkout -q "${{ env.KSUN_COMMIT }}" && cd ..
+                ( cd KernelSU-Next && git fetch --depth 1 origin "${{ env.KSUN_COMMIT }}" && git checkout -q "${{ env.KSUN_COMMIT }}" )
                 apply_susfs "${{ env.KSUN_SUSFS_REPO }}" "${{ env.KSUN_SUSFS_COMMIT }}" susfs-simonpunk
               fi ;;
             SukiSU-Ultra)
               curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh" | bash -s "${{ env.SUKISU_REF }}"
-              cd KernelSU && git fetch --depth 1 origin "${{ env.SUKISU_COMMIT }}" && git checkout -q "${{ env.SUKISU_COMMIT }}" && cd ..
-              if [ "$SUSFS" = "y" ]; then apply_susfs "${{ env.SUKISU_SUSFS_REPO }}" "${{ env.SUKISU_SUSFS_COMMIT }}" susfs-shirkneko; fi
-              SKP="${{ env.CACHE }}/SukiSU_patch"
-              git clone --depth 1 "${{ env.SUKISU_PATCH_REPO }}" "$SKP"
-              cp "$SKP/${{ env.SUKISU_HOOKS }}" ./sukisu_hooks.patch
-              patch -p1 -F 3 < ./sukisu_hooks.patch ;;
+              ( cd KernelSU && git fetch --depth 1 origin "${{ env.SUKISU_COMMIT }}" && git checkout -q "${{ env.SUKISU_COMMIT }}" )
+              [ "$SUSFS" = "y" ] && apply_susfs "${{ env.SUKISU_SUSFS_REPO }}" "${{ env.SUKISU_SUSFS_COMMIT }}" susfs-shirkneko
+              SKP="${{ env.CACHE }}/SukiSU_patch"; [ -d "$SKP/.git" ] || git clone --depth 1 "${{ env.SUKISU_PATCH_REPO }}" "$SKP"
+              cp "$SKP/${{ env.SUKISU_HOOKS }}" ./sukisu_hooks.patch; patch -p1 -F 3 < ./sukisu_hooks.patch ;;
             ReSukiSU)
               curl -LSs "https://raw.githubusercontent.com/ReSukiSU/ReSukiSU/main/kernel/setup.sh" | bash -s "${{ env.RESUKISU_REF }}"
-              cd KernelSU && git fetch --depth 1 origin "${{ env.RESUKISU_COMMIT }}" && git checkout -q "${{ env.RESUKISU_COMMIT }}" && cd ..
-              if [ "$SUSFS" = "y" ]; then apply_susfs "${{ env.KSUN_SUSFS_REPO }}" "${{ env.RESUKISU_SUSFS_COMMIT }}" susfs-simonpunk; fi
-              
-              cat > ${{ env.ROOT }}/resukisu_stat_hooks.py <<'PY'
+              ( cd KernelSU && git fetch --depth 1 origin "${{ env.RESUKISU_COMMIT }}" && git checkout -q "${{ env.RESUKISU_COMMIT }}" )
+              [ "$SUSFS" = "y" ] && apply_susfs "${{ env.KSUN_SUSFS_REPO }}" "${{ env.RESUKISU_SUSFS_COMMIT }}" susfs-simonpunk ;;
+            None) echo "Stock vanilla — no root." ;;
+          esac
+
+      # ReSukiSU needs ksu_handle_newfstat_ret + ksu_handle_fstat64_ret in
+      # fs/stat.c (no SusFS fork provides them for android14-6.1). Idempotent.
+      - name: Integrate ReSukiSU stat hooks
+        if: github.event.inputs.variant == 'ReSukiSU'
+        run: |
+          python3 - ${{ env.KSRC }}/fs/stat.c <<'PY'
           import re, sys
           f = sys.argv[1]; s = open(f).read()
-          if "ksu_handle_newfstat_ret" in s: sys.exit(0)
+          if "ksu_handle_newfstat_ret" in s:
+              print("already present; skipping"); sys.exit(0)
           has_stat = "ksu_handle_stat" in s
           ext = "\n#ifdef CONFIG_KSU_MANUAL_HOOK\n"
-          if not has_stat: ext += "extern int ksu_handle_stat(int *dfd, const char __user **filename_user, int *flags);\n"
+          if not has_stat:
+              ext += "extern int ksu_handle_stat(int *dfd, const char __user **filename_user, int *flags);\n"
           ext += "extern void ksu_handle_newfstat_ret(unsigned int *fd, struct stat __user **statbuf_ptr);\n"
           ext += "#if defined(__ARCH_WANT_STAT64) || defined(__ARCH_WANT_COMPAT_STAT64)\n"
           ext += "extern void ksu_handle_fstat64_ret(unsigned long *fd, struct stat64 __user **statbuf_ptr);\n"
           ext += "#endif\n#endif\n\n"
           anchor = "#if defined(__ARCH_WANT_STAT64) || defined(__ARCH_WANT_COMPAT_STAT64)"
-          i = s.find(anchor); assert i != -1
+          i = s.find(anchor); assert i != -1, "extern anchor missing"
           s = s[:i] + ext + s[i:]
-          s, n = re.subn(r"(SYSCALL_DEFINE2\(fstat64,.*?cp_new_stat64\(&stat, statbuf\);\n)(\n\treturn error;)", r"\1\n#ifdef CONFIG_KSU_MANUAL_HOOK\n\tksu_handle_fstat64_ret(&fd, &statbuf);\n#endif\2", s, count=1, flags=re.S)
-          s, n = re.subn(r"(COMPAT_SYSCALL_DEFINE2\(newfstat,.*?cp_compat_stat\(&stat, statbuf\);\n)(\treturn error;)", r"\1#ifdef CONFIG_KSU_MANUAL_HOOK\n\tksu_handle_newfstat_ret(&fd, (struct stat __user**)&statbuf);\n#endif\n\2", s, count=1, flags=re.S)
+          s, n = re.subn(r"(SYSCALL_DEFINE2\(fstat64,.*?cp_new_stat64\(&stat, statbuf\);\n)(\n\treturn error;)",
+              r"\1\n#ifdef CONFIG_KSU_MANUAL_HOOK\n\tksu_handle_fstat64_ret(&fd, &statbuf);\n#endif\2", s, count=1, flags=re.S)
+          assert n == 1, "fstat64 hook failed"
+          s, n = re.subn(r"(COMPAT_SYSCALL_DEFINE2\(newfstat,.*?cp_compat_stat\(&stat, statbuf\);\n)(\treturn error;)",
+              r"\1#ifdef CONFIG_KSU_MANUAL_HOOK\n\tksu_handle_newfstat_ret(&fd, (struct stat __user**)&statbuf);\n#endif\n\2", s, count=1, flags=re.S)
+          assert n == 1, "newfstat hook failed"
           if not has_stat:
-              s, n = re.subn(r"(SYSCALL_DEFINE4\(newfstatat,.*?\n\tint error;\n)(\n\terror = vfs_fstatat)", r"\1\n#ifdef CONFIG_KSU_MANUAL_HOOK\n\tksu_handle_stat(&dfd, &filename, &flag);\n#endif\2", s, count=1, flags=re.S)
+              s, n = re.subn(r"(SYSCALL_DEFINE4\(newfstatat,.*?\n\tint error;\n)(\n\terror = vfs_fstatat)",
+                  r"\1\n#ifdef CONFIG_KSU_MANUAL_HOOK\n\tksu_handle_stat(&dfd, &filename, &flag);\n#endif\2", s, count=1, flags=re.S)
+              assert n == 1, "newfstatat stat hook failed"
           open(f, "w").write(s)
+          print("ReSukiSU stat hooks integrated (had_susfs_stat=%s)" % has_stat)
           PY
-              python3 ${{ env.ROOT }}/resukisu_stat_hooks.py fs/stat.c ;;
-          esac
 
-      - name: Inject Kconfig Fragments
+      # gki_defconfig ONLY (+ root/SusFS). No vendor fragments — keep the Image
+      # KMI-identical to the stock generic GKI so vendor_dlkm modules still load.
+      - name: Inject Kconfig
         run: |
           cd ${{ env.KSRC }}
           DEFCONFIG=arch/arm64/configs/gki_defconfig
           echo "# CONFIG_WERROR is not set" >> "$DEFCONFIG"
-          echo "# CONFIG_MODULE_SIG_ALL is not set" >> "$DEFCONFIG"
-          
-          for FRAG in "arch/arm64/configs/vendor/${{ env.SOC }}_GKI.config" \
-                      "arch/arm64/configs/vendor/${{ env.DEVICE_PROJECT }}.config"; do
-            if [ -f "$FRAG" ]; then
-              cat "$FRAG" >> "$DEFCONFIG"
-              echo "Applied fragment: $FRAG"
-            else
-              echo "!! Fragment missing: $FRAG" && exit 1
-            fi
-          done
-          
-          echo "CONFIG_LOCALVERSION=\"-gki\"" >> "$DEFCONFIG"
-          
           if [ "${{ github.event.inputs.variant }}" != "None" ]; then
             echo "CONFIG_KSU=y" >> "$DEFCONFIG"
             if [ "${{ github.event.inputs.susfs }}" = "y" ]; then
@@ -241,56 +236,88 @@ jobs:
           CONFIG_KSU_SUSFS_SUS_SU=n
           EOF
             fi
-            
             case "${{ github.event.inputs.variant }}" in
               SukiSU-Ultra)
                 echo "CONFIG_KSU_MANUAL_HOOK=y" >> "$DEFCONFIG"
-                if [ "${{ github.event.inputs.kpm }}" = "y" ]; then echo "CONFIG_KPM=y" >> "$DEFCONFIG"; fi ;;
+                [ "${{ github.event.inputs.kpm }}" = "y" ] && echo "CONFIG_KPM=y" >> "$DEFCONFIG" ;;
               ReSukiSU)
                 printf 'CONFIG_KSU_MANUAL_HOOK=y\nCONFIG_KSU_MANUAL_HOOK_AUTO_SETUID_HOOK=y\nCONFIG_KSU_MANUAL_HOOK_AUTO_INITRC_HOOK=y\nCONFIG_KSU_MANUAL_HOOK_AUTO_INPUT_HOOK=y\n' >> "$DEFCONFIG" ;;
             esac
           fi
+
+      - name: Cache ccache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.CCDIR }}
+          key: ccache-${{ github.event.inputs.variant }}-${{ github.sha }}
+          restore-keys: |
+            ccache-${{ github.event.inputs.variant }}-
+            ccache-
 
       - name: Build Kernel Image
         run: |
           cd ${{ env.KSRC }}
           export CCACHE_DIR="${{ env.CCDIR }}" CCACHE_MAXSIZE=10G CCACHE_COMPILERCHECK=content
           export KBUILD_BUILD_USER=prabh KBUILD_BUILD_HOST=xeon ARCH=arm64 SUBARCH=arm64
-          
           MASK="${{ env.ROOT }}/.ccmask"; mkdir -p "$MASK"
-          ln -sf "$(command -v ccache)" "$MASK/clang"
-          ln -sf "$(command -v ccache)" "$MASK/clang++"
+          ln -sf "$(command -v ccache)" "$MASK/clang"; ln -sf "$(command -v ccache)" "$MASK/clang++"
           export PATH="$MASK:${{ env.TCDIR }}/bin:$PATH"
-          
           MK="O=${{ env.OUT }} ARCH=arm64 LLVM=1 LLVM_IAS=1"
           make $MK gki_defconfig
-          
           if [ "${{ github.event.inputs.disable_lto }}" = "y" ]; then
             ./scripts/config --file "${{ env.OUT }}/.config" -d LTO_CLANG_THIN -d LTO_CLANG_FULL -e LTO_NONE
             make $MK olddefconfig
           fi
-          
-          make $MK NT_PROJECT="${{ env.DEVICE_PROJECT }}" -j"$(nproc)" Image
+          make $MK -j"$(nproc)" Image
+          echo "--- ccache stats ---"; ccache -s
+          ls -lh ${{ env.OUT }}/arch/arm64/boot/Image
+
+      - name: Collect Build Info
+        run: |
+          cd ${{ env.KSRC }}
+          KVER="$(strings ${{ env.OUT }}/arch/arm64/boot/Image | grep -m1 'Linux version' || echo unknown)"
+          SRC_SHA="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
+          KDIR="$([ -d KernelSU-Next ] && echo KernelSU-Next || echo KernelSU)"
+          KVERROOT="$([ -d "$KDIR/.git" ] && git -C "$KDIR" describe --tags --always 2>/dev/null || echo '-')"
+          {
+            echo "=========================================================="
+            echo " Xeon · Nothing 3a Pro (asteroids/sm7635) kernel build"
+            echo "=========================================================="
+            echo "Built     : $(date -u '+%Y-%m-%d %H:%M UTC')"
+            echo "Kernel    : $KVER"
+            echo "Root      : ${{ env.RVTAG }}"
+            echo "Root ver  : $KVERROOT"
+            echo "Toolchain : ${{ github.event.inputs.toolchain }} — $(${{ env.TCDIR }}/bin/clang --version | head -1)"
+            echo "LTO       : $([ "${{ github.event.inputs.disable_lto }}" = "y" ] && echo disabled || echo enabled)"
+            echo "Source    : ${{ env.KERNEL_REPO }}"
+            echo "Branch    : ${{ env.KERNEL_BRANCH }} @ $SRC_SHA"
+            echo "Config    : gki_defconfig (+ root/SusFS Kconfig)"
+            echo "By        : prabh (resurrected21)"
+          } | tee ${{ env.ROOT }}/build-info.txt
 
       - name: Package AnyKernel3 Zip
         run: |
           git clone --depth 1 https://github.com/osm0sis/AnyKernel3 ${{ env.AK3 }}
-          
-          mkdir -p ${{ env.TOOLS }}
+          rm -rf ${{ env.AK3 }}/.git ${{ env.AK3 }}/.github ${{ env.AK3 }}/README.md
+          # Bundle a fresh arm64 magiskboot into AK3 (overrides its stale copy —
+          # helps avoid the on-device "Repacking image failed" issue).
           url=$(curl -s https://api.github.com/repos/topjohnwu/Magisk/releases/latest | grep -oE 'https://[^"]+Magisk-v[^"]+\.apk' | head -1)
-          curl -L --fail -o "${{ env.TOOLS }}/Magisk-latest.apk" "$url"
-          unzip -o -q "${{ env.TOOLS }}/Magisk-latest.apk" "lib/arm64-v8a/libmagiskboot.so" -d /tmp/mb_arm
-          install -m755 "/tmp/mb_arm/lib/arm64-v8a/libmagiskboot.so" "${{ env.AK3 }}/tools/magiskboot"
-          
+          curl -L --fail -o "${{ env.TOOLS }}/Magisk.apk" "$url"
+          unzip -o -q "${{ env.TOOLS }}/Magisk.apk" "lib/arm64-v8a/libmagiskboot.so" -d /tmp/mb
+          install -m755 "/tmp/mb/lib/arm64-v8a/libmagiskboot.so" "${{ env.AK3 }}/tools/magiskboot"
+
           cp ${{ env.OUT }}/arch/arm64/boot/Image ${{ env.AK3 }}/Image
-          
+          cp ${{ env.ROOT }}/build-info.txt ${{ env.AK3 }}/build-info.txt
           cat > ${{ env.AK3 }}/anykernel.sh <<EOF
           ### AnyKernel3 — Nothing Phone (3a) Pro [asteroids]
           properties() { '
-          kernel.string=Xeon · Nothing 3a Pro ${{ env.RVTAG }} by prabh (GHA Build)
+          kernel.string=Xeon · Nothing 3a Pro ${{ env.RVTAG }} by prabh (resurrected21)
+          do.devicecheck=0
+          do.modules=0
+          do.systemless=1
+          do.cleanup=1
+          do.cleanuponabort=1
           device.name1=asteroids
-          device.name2=Bakery
-          device.name3=NothingPhone3a
           supported.versions=
           supported.patchlevels=
           '; }
@@ -302,16 +329,13 @@ jobs:
           split_boot;
           flash_boot;
           EOF
-          
           cd ${{ env.AK3 }}
           ZIP_NAME="Xeon-NP3aPro-${{ env.RVTAG }}-${{ env.STAMP }}.zip"
           zip -r9 "$ZIP_NAME" . -x '*.git*' README.md >/dev/null
           mv "$ZIP_NAME" ${{ env.ROOT }}/
-          echo "FINAL_ZIP_PATH=${{ env.ROOT }}/$ZIP_NAME" >> $GITHUB_ENV
 
       - name: Upload Kernel Artifact
         uses: actions/upload-artifact@v4
         with:
           name: Xeon-Kernel-Asteroids-${{ env.RVTAG }}-${{ env.STAMP }}
           path: ${{ env.ROOT }}/*.zip
-          
