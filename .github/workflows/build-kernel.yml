@@ -39,6 +39,16 @@ on:
         default: 'y'
         type: choice
         options: ['y', 'n']
+      output_type:
+        description: 'Output (boot.img needs a stock source below)'
+        required: true
+        default: 'Zip only'
+        type: choice
+        options: ['Zip only', 'Zip + boot.img']
+      stock_url:
+        description: 'Stock source for boot.img: firmware .7z/.zip/payload.bin OR a direct boot.img URL'
+        required: false
+        default: ''
 
 jobs:
   build:
@@ -339,3 +349,60 @@ jobs:
         with:
           name: Xeon-Kernel-Asteroids-${{ env.RVTAG }}-${{ env.STAMP }}
           path: ${{ env.ROOT }}/*.zip
+
+      # Optional: swap our kernel into your STOCK boot.img → fastboot-flashable.
+      # Handles .7z / .zip / .gz / .img / payload.bin. Skipped unless you pick
+      # "Zip + boot.img" AND provide a stock source. Must match your CURRENT
+      # firmware (now 6.1.157) or AVB/anti-rollback can reject it.
+      - name: Build boot.img
+        id: bootimg
+        if: github.event.inputs.output_type == 'Zip + boot.img' && github.event.inputs.stock_url != ''
+        run: |
+          BW="${{ env.ROOT }}/bootwork"; mkdir -p "$BW"; cd "$BW"
+          # x86_64 magiskboot for the runner (not the arm64 one bundled in AK3).
+          url=$(curl -s https://api.github.com/repos/topjohnwu/Magisk/releases/latest | grep -oE 'https://[^"]+Magisk-v[^"]+\.apk' | head -1)
+          curl -L --fail -o m.apk "$url"; unzip -o -q m.apk 'lib/x86_64/*' -d mb
+          cp mb/lib/x86_64/libmagiskboot.so ./magiskboot && chmod +x ./magiskboot
+
+          SRC="${{ github.event.inputs.stock_url }}"
+          echo "Stock source: $SRC"
+          curl -L -o src.dl "$SRC"
+          case "$SRC" in
+            *.7z)           7z x -y src.dl >/dev/null ;;
+            *.zip)          unzip -o -q src.dl ;;
+            *.tar.gz|*.tgz) tar xf src.dl ;;
+            *.gz)           gzip -dc src.dl > extracted.img ;;
+            *.img)          cp src.dl stock_boot.img ;;
+            *.bin)          cp src.dl payload.bin ;;
+            *)              cp src.dl unknown.bin ;;
+          esac
+          if [ ! -f stock_boot.img ]; then
+            B=$(find . -name 'boot.img' | head -1)
+            if [ -n "$B" ]; then cp "$B" stock_boot.img
+            elif [ -f extracted.img ]; then mv extracted.img stock_boot.img
+            else
+              P=$(find . -name 'payload.bin' | head -1)
+              [ -z "$P" ] && [ -f unknown.bin ] && P=unknown.bin
+              if [ -n "$P" ]; then
+                pd=$(curl -s https://api.github.com/repos/ssut/payload-dumper-go/releases/latest | grep -oE 'https://[^"]+_linux_amd64\.tar\.gz' | head -1)
+                curl -L -o pd.tgz "$pd"; tar xf pd.tgz
+                ./payload-dumper-go -p boot -o . "$P"; mv boot.img stock_boot.img
+              fi
+            fi
+          fi
+          [ -f stock_boot.img ] || { echo "::error::No boot.img found in the stock source."; exit 1; }
+          head -c8 stock_boot.img | grep -q ANDROID || echo "::warning::stock_boot.img isn't an 'ANDROID!' image — wrong file?"
+
+          ./magiskboot unpack stock_boot.img
+          cp ${{ env.OUT }}/arch/arm64/boot/Image ./kernel
+          ./magiskboot repack stock_boot.img
+          mv new-boot.img "${{ env.ROOT }}/Xeon-NP3aPro-${{ env.RVTAG }}-boot.img"
+          ls -lh "${{ env.ROOT }}/Xeon-NP3aPro-${{ env.RVTAG }}-boot.img"
+
+      - name: Upload boot.img
+        if: steps.bootimg.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: Xeon-NP3aPro-${{ env.RVTAG }}-boot-${{ env.STAMP }}
+          path: ${{ env.ROOT }}/*-boot.img
+          if-no-files-found: error
