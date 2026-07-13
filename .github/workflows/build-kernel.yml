@@ -170,6 +170,11 @@ jobs:
             git -C "$d" -c advice.detachedHead=false checkout -q FETCH_HEAD
             cp "$d"/kernel_patches/fs/* fs/
             cp "$d"/kernel_patches/include/linux/* include/linux/
+            # AOSP-common android14-6.1 "fake patches" (from WildKernels): align
+            # the source context so the susfs patch applies cleanly (no rejects).
+            sed -i '/^#include <trace\/events\/oom.h>$/a #include <trace/hooks/sched.h>' fs/proc/base.c || true
+            sed -i '/^#include <linux\/cpufreq_times.h>$/a #include <linux/dma-buf.h>' fs/proc/base.c || true
+            sed -i '/^#include <trace\/hooks\/blk.h>$/d' fs/namespace.c || true
             patch -p1 --fuzz=3 < "$d/kernel_patches/50_add_susfs_in_${{ env.SUSFS_BRANCH }}.patch"
           }
           case "$VARIANT" in
