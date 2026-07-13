@@ -92,8 +92,11 @@ jobs:
           echo "AK3=$GITHUB_WORKSPACE/workspace/AnyKernel3" >> $GITHUB_ENV
           echo "CCDIR=$GITHUB_WORKSPACE/workspace/.ccache" >> $GITHUB_ENV
 
-          echo "KERNEL_REPO=https://github.com/NothingOSS/android_kernel_msm-6.1_nothing_sm7635" >> $GITHUB_ENV
-          echo "KERNEL_BRANCH=sm7635/b/mr_Frogger" >> $GITHUB_ENV
+          # AOSP-common GKI (like WildKernels). susfs patches apply CLEANLY here
+          # (no fuzz), so the KMI stays intact and stock WiFi/BT/audio modules load.
+          # android14-6.1-2025-12 == 6.1.157, matching your firmware exactly.
+          echo "KERNEL_REPO=https://android.googlesource.com/kernel/common" >> $GITHUB_ENV
+          echo "KERNEL_BRANCH=android14-6.1-2025-12" >> $GITHUB_ENV
           echo "SUSFS_BRANCH=gki-android14-6.1" >> $GITHUB_ENV
           echo "AOSP_CLANG_URL=https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/android14-release/clang-r487747c.tar.gz" >> $GITHUB_ENV
 
@@ -324,12 +327,14 @@ jobs:
         run: |
           git clone --depth 1 https://github.com/osm0sis/AnyKernel3 ${{ env.AK3 }}
           rm -rf ${{ env.AK3 }}/.git ${{ env.AK3 }}/.github ${{ env.AK3 }}/README.md
-          # Bundle a fresh arm64 magiskboot into AK3 (overrides its stale copy —
-          # helps avoid the on-device "Repacking image failed" issue).
+          # Replace AK3's tools with ARM64 binaries from the Magisk APK. osm0sis
+          # ships a 32-bit-ARM busybox that fails on arm64-only devices
+          # ("busybox setup failed") — swap in the arm64 busybox (and magiskboot).
           url=$(curl -s https://api.github.com/repos/topjohnwu/Magisk/releases/latest | grep -oE 'https://[^"]+Magisk-v[^"]+\.apk' | head -1)
           curl -L --fail -o "${{ env.TOOLS }}/Magisk.apk" "$url"
-          unzip -o -q "${{ env.TOOLS }}/Magisk.apk" "lib/arm64-v8a/libmagiskboot.so" -d /tmp/mb
+          unzip -o -q "${{ env.TOOLS }}/Magisk.apk" "lib/arm64-v8a/*" -d /tmp/mb
           install -m755 "/tmp/mb/lib/arm64-v8a/libmagiskboot.so" "${{ env.AK3 }}/tools/magiskboot"
+          install -m755 "/tmp/mb/lib/arm64-v8a/libbusybox.so"    "${{ env.AK3 }}/tools/busybox"
 
           cp ${{ env.OUT }}/arch/arm64/boot/Image ${{ env.AK3 }}/Image
           cp ${{ env.ROOT }}/build-info.txt ${{ env.AK3 }}/build-info.txt
